@@ -9,13 +9,14 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
+use errors::{Code, Error};
 use iceberg::spec::Schema as IcebergSchema;
 use silo::backend::filesystem::FilesystemDestinationWriter;
 use silo::backend::DestinationWriter;
 use silo::config::CatalogConfig;
 use silo::destination::{Destination, MultiDestination, SingleDestination};
 use silo::ingest::{IcebergTableSink, TableSink};
-use silo::{SinkError, StreamId};
+use silo::StreamId;
 
 fn sample_batch() -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -109,23 +110,23 @@ impl DestinationWriter for FailingWriter {
         "failing"
     }
 
-    async fn ensure_table(&mut self, _stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, SinkError> {
+    async fn ensure_table(&mut self, _stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
         Ok(schema.clone())
     }
 
-    async fn write(&mut self, _stream: &StreamId, _batch: &RecordBatch) -> Result<(), SinkError> {
-        Err(SinkError::Other("boom".to_string()))
+    async fn write(&mut self, _stream: &StreamId, _batch: &RecordBatch) -> Result<(), Error> {
+        Err(Error::new_internal(Code::INTERNAL, "boom"))
     }
 
-    async fn evolve_schema(&mut self, _stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, SinkError> {
+    async fn evolve_schema(&mut self, _stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
         Ok(schema.clone())
     }
 
-    async fn close(&mut self, _stream: &StreamId) -> Result<(), SinkError> {
+    async fn close(&mut self, _stream: &StreamId) -> Result<(), Error> {
         Ok(())
     }
 
-    async fn check(&self) -> Result<(), SinkError> {
+    async fn check(&self) -> Result<(), Error> {
         Ok(())
     }
 }

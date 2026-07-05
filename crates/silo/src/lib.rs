@@ -1,10 +1,15 @@
 pub mod backend;
 pub mod config;
 pub mod destination;
-mod error;
 pub mod ingest;
 
-pub use error::SinkError;
+/// Wraps an iceberg-rust error at the crate boundary, per `errors`' contract
+/// that only the boundary receiving an untyped external error assigns it a
+/// type/code/message. Callers pass their own `Code` so distinct failure
+/// sites stay distinguishable instead of collapsing onto one generic code.
+pub(crate) fn wrap_iceberg(e: iceberg::Error, code: errors::Code, message: impl Into<String>) -> errors::Error {
+    errors::Error::wrap_internal(e, code, message)
+}
 
 /// Identifies one logical stream/table synced into a destination.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

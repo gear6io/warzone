@@ -5,7 +5,7 @@
 //! identical, so it lives here once instead of being duplicated per backend.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arrow_array::RecordBatch;
 use iceberg::io::StorageFactory;
@@ -23,8 +23,23 @@ use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent
 use iceberg_catalog_rest::RestCatalogBuilder;
 use parquet::file::properties::WriterProperties;
 
+use errors::{Code, Error};
+
 use crate::config::CatalogConfig;
-use crate::{SinkError, StreamId};
+use crate::{wrap_iceberg, StreamId};
+
+static CODE_CATALOG_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("catalog_load_failed"));
+static CODE_INVALID_STREAM_IDENTIFIER: LazyLock<Code> = LazyLock::new(|| Code::must_new("invalid_stream_identifier"));
+static CODE_NAMESPACE_SETUP_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("namespace_setup_failed"));
+static CODE_TABLE_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_load_failed"));
+static CODE_UNKNOWN_STREAM: LazyLock<Code> = LazyLock::new(|| Code::must_new("unknown_stream"));
+static CODE_SCHEMA_CONVERSION_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("schema_conversion_failed"));
+static CODE_BATCH_RETAG_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("batch_retag_failed"));
+static CODE_PARQUET_WRITE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("parquet_write_failed"));
+static CODE_TABLE_COMMIT_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_commit_failed"));
+static CODE_SCHEMA_EVOLUTION_UNSUPPORTED: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("schema_evolution_unsupported"));
+static CODE_CATALOG_CHECK_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("catalog_check_failed"));
 
 /// Builds the `Catalog` for one destination from its `CatalogConfig` plus
 /// the backend-supplied storage factory/props (S3 credentials, or nothing
@@ -34,7 +49,7 @@ pub(crate) async fn build_catalog(
     catalog: &CatalogConfig,
     storage_factory: Arc<dyn StorageFactory>,
     mut storage_props: HashMap<String, String>,
-) -> Result<Arc<dyn Catalog>, SinkError> {
+) -> Result<Arc<dyn Catalog>, Error> {
     match catalog {
         CatalogConfig::Rest { uri, warehouse, props } => {
             storage_props.extend(props.clone());
@@ -43,7 +58,8 @@ pub(crate) async fn build_catalog(
             let catalog = RestCatalogBuilder::default()
                 .with_storage_factory(storage_factory)
                 .load("silo", storage_props)
-                .await?;
+                .await
+                .map_err(|e| wrap_iceberg(e, CODE_CATALOG_LOAD_FAILED.clone(), "failed to load REST catalog"))?;
             Ok(Arc::new(catalog))
         }
         CatalogConfig::Memory { warehouse } => {
@@ -51,7 +67,8 @@ pub(crate) async fn build_catalog(
             let catalog = iceberg::memory::MemoryCatalogBuilder::default()
                 .with_storage_factory(storage_factory)
                 .load("silo", storage_props)
-                .await?;
+                .await
+                .map_err(|e| wrap_iceberg(e, CODE_CATALOG_LOAD_FAILED.clone(), "failed to load memory catalog"))?;
             Ok(Arc::new(catalog))
         }
     }
@@ -77,8 +94,10 @@ impl IcebergBackend {
         &self.name
     }
 
-    fn ident(stream: &StreamId) -> Result<TableIdent, SinkError> {
-        let ns = NamespaceIdent::from_strs(stream.namespace.iter())?;
+    fn ident(stream: &StreamId) -> Result<TableIdent, Error> {
+        let ns = NamespaceIdent::from_strs(stream.namespace.iter()).map_err(|e| {
+            wrap_iceberg(e, CODE_INVALID_STREAM_IDENTIFIER.clone(), format!("invalid namespace for stream {stream:?}"))
+        })?;
         Ok(TableIdent::new(ns, stream.table.clone()))
     }
 
@@ -86,21 +105,31 @@ impl IcebergBackend {
         &mut self,
         stream: &StreamId,
         schema: &IcebergSchema,
-    ) -> Result<IcebergSchema, SinkError> {
+    ) -> Result<IcebergSchema, Error> {
         let ident = Self::ident(stream)?;
 
-        if !self.catalog.namespace_exists(ident.namespace()).await? {
-            self.catalog.create_namespace(ident.namespace(), HashMap::new()).await?;
+        let namespace_setup_failed =
+            |e| wrap_iceberg(e, CODE_NAMESPACE_SETUP_FAILED.clone(), "failed to ensure namespace exists");
+        if !self.catalog.namespace_exists(ident.namespace()).await.map_err(namespace_setup_failed)? {
+            self.catalog
+                .create_namespace(ident.namespace(), HashMap::new())
+                .await
+                .map_err(namespace_setup_failed)?;
         }
 
-        let table = if self.catalog.table_exists(&ident).await? {
-            self.catalog.load_table(&ident).await?
+        let table_load_failed =
+            |e| wrap_iceberg(e, CODE_TABLE_LOAD_FAILED.clone(), "failed to load or create table");
+        let table = if self.catalog.table_exists(&ident).await.map_err(table_load_failed)? {
+            self.catalog.load_table(&ident).await.map_err(table_load_failed)?
         } else {
             let creation = TableCreation::builder()
                 .name(ident.name().to_string())
                 .schema(schema.clone())
                 .build();
-            self.catalog.create_table(ident.namespace(), creation).await?
+            self.catalog
+                .create_table(ident.namespace(), creation)
+                .await
+                .map_err(table_load_failed)?
         };
 
         let current_schema = table.metadata().current_schema().as_ref().clone();
@@ -108,11 +137,11 @@ impl IcebergBackend {
         Ok(current_schema)
     }
 
-    pub(crate) async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), SinkError> {
+    pub(crate) async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), Error> {
         let table = self
             .tables
             .get(stream)
-            .ok_or_else(|| SinkError::UnknownStream(stream.clone()))?
+            .ok_or_else(|| Error::new_not_found(CODE_UNKNOWN_STREAM.clone(), format!("unknown stream {stream:?}")))?
             .clone();
 
         // The incoming batch's Arrow schema generally has no Iceberg
@@ -121,15 +150,26 @@ impl IcebergBackend {
         // carry a `PARQUET:field_id` matching the table's schema. Re-tag the
         // batch against the table's own current schema (the source of
         // truth for field ids) rather than trying to invent ids ourselves.
-        let arrow_schema_with_ids =
-            Arc::new(iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?);
-        let batch = RecordBatch::try_new(arrow_schema_with_ids, batch.columns().to_vec())
-            .map_err(|e| SinkError::Other(e.to_string()))?;
+        let arrow_schema_with_ids = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(|e| {
+                wrap_iceberg(e, CODE_SCHEMA_CONVERSION_FAILED.clone(), "failed to convert table schema to Arrow")
+            })?,
+        );
+        let batch = RecordBatch::try_new(arrow_schema_with_ids, batch.columns().to_vec()).map_err(|e| {
+            Error::wrap_internal(
+                e,
+                CODE_BATCH_RETAG_FAILED.clone(),
+                "failed to retag record batch with table field ids",
+            )
+        })?;
 
         // ponytail: one Parquet file + one commit per write() call — simplest
         // correct thing. Batch multiple writes into one transaction/file when
         // commit-frequency or small-file-count actually becomes a problem.
-        let location_generator = DefaultLocationGenerator::new(table.metadata().clone())?;
+        let parquet_write_failed =
+            |e| wrap_iceberg(e, CODE_PARQUET_WRITE_FAILED.clone(), "failed to write Parquet data file");
+        let location_generator =
+            DefaultLocationGenerator::new(table.metadata().clone()).map_err(parquet_write_failed)?;
         let file_name_generator =
             DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet);
         let parquet_writer_builder = ParquetWriterBuilder::new(
@@ -143,30 +183,45 @@ impl IcebergBackend {
             file_name_generator,
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
-        let mut writer = data_file_writer_builder.build(None).await?;
-        writer.write(batch).await?;
-        let data_files = writer.close().await?;
+        let mut writer = data_file_writer_builder.build(None).await.map_err(parquet_write_failed)?;
+        writer.write(batch).await.map_err(parquet_write_failed)?;
+        let data_files = writer.close().await.map_err(parquet_write_failed)?;
 
+        let table_commit_failed =
+            |e| wrap_iceberg(e, CODE_TABLE_COMMIT_FAILED.clone(), "failed to commit fast-append transaction");
         let tx = Transaction::new(&table);
-        let tx = tx.fast_append().add_data_files(data_files).apply(tx)?;
-        let updated_table = tx.commit(self.catalog.as_ref()).await?;
+        let tx = tx.fast_append().add_data_files(data_files).apply(tx).map_err(table_commit_failed)?;
+        let updated_table = tx.commit(self.catalog.as_ref()).await.map_err(table_commit_failed)?;
 
         self.tables.insert(stream.clone(), updated_table);
         Ok(())
     }
 
-    /// See [`SinkError::SchemaEvolutionUnsupported`].
-    pub(crate) fn evolve_schema(&self, stream: &StreamId, fields: Vec<String>) -> Result<IcebergSchema, SinkError> {
-        Err(SinkError::SchemaEvolutionUnsupported { stream: stream.clone(), fields })
+    /// iceberg-rust 0.9.1 exposes no public way to evolve an existing table's
+    /// schema: `Transaction` has no `update_schema`, and `TableCommit`'s
+    /// builder is private ("dangerous and error-prone to construct
+    /// directly"), so external crates cannot apply `TableUpdate::AddSchema`
+    /// themselves. Revisit once upstream adds a `Transaction` schema action.
+    pub(crate) fn evolve_schema(&self, stream: &StreamId, fields: Vec<String>) -> Result<IcebergSchema, Error> {
+        Err(Error::new_unsupported(
+            CODE_SCHEMA_EVOLUTION_UNSUPPORTED.clone(),
+            format!(
+                "schema evolution for stream {stream:?} is not supported by iceberg-rust 0.9.1 \
+                 (no public Transaction::update_schema); new/changed fields: {fields:?}"
+            ),
+        ))
     }
 
-    pub(crate) fn close(&mut self, stream: &StreamId) -> Result<(), SinkError> {
+    pub(crate) fn close(&mut self, stream: &StreamId) -> Result<(), Error> {
         self.tables.remove(stream);
         Ok(())
     }
 
-    pub(crate) async fn check(&self) -> Result<(), SinkError> {
-        self.catalog.list_namespaces(None).await?;
+    pub(crate) async fn check(&self) -> Result<(), Error> {
+        self.catalog
+            .list_namespaces(None)
+            .await
+            .map_err(|e| wrap_iceberg(e, CODE_CATALOG_CHECK_FAILED.clone(), "connectivity/permissions check failed"))?;
         Ok(())
     }
 }

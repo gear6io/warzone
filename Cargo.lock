@@ -2628,6 +2628,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "errors",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -2635,7 +2636,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
 ]
 

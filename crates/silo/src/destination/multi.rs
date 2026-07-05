@@ -1,12 +1,18 @@
+use std::sync::LazyLock;
+
 use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use iceberg::spec::Schema as IcebergSchema;
 use tokio::task::JoinSet;
 
+use errors::{Code, Error};
+
 use super::Destination;
 use crate::backend::DestinationWriter;
-use crate::{SinkError, StreamId};
+use crate::StreamId;
 
+static CODE_DESTINATION_TASK_PANICKED: LazyLock<Code> = LazyLock::new(|| Code::must_new("destination_task_panicked"));
+static CODE_DESTINATIONS_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("destinations_failed"));
 /// Fans the same call out to every configured destination writer.
 ///
 /// **Fail-fast, without cancellation.** All destinations for the *current*
@@ -32,8 +38,8 @@ impl MultiDestination {
 }
 
 async fn join_all(
-    mut set: JoinSet<(Box<dyn DestinationWriter>, Result<(), SinkError>)>,
-) -> (Vec<Box<dyn DestinationWriter>>, Vec<(String, SinkError)>) {
+    mut set: JoinSet<(Box<dyn DestinationWriter>, Result<(), Error>)>,
+) -> (Vec<Box<dyn DestinationWriter>>, Vec<(String, Error)>) {
     let mut writers = Vec::new();
     let mut failures = Vec::new();
     while let Some(joined) = set.join_next().await {
@@ -43,24 +49,39 @@ async fn join_all(
                 failures.push((writer.name().to_string(), err));
                 writers.push(writer);
             }
-            Err(join_err) => failures.push(("<task panicked>".to_string(), SinkError::Other(join_err.to_string()))),
+            Err(join_err) => failures.push((
+                "<task panicked>".to_string(),
+                Error::wrap_internal(join_err, CODE_DESTINATION_TASK_PANICKED.clone(), "destination task panicked"),
+            )),
         }
     }
     (writers, failures)
 }
 
-fn finish(total: usize, failures: Vec<(String, SinkError)>) -> Result<(), SinkError> {
+/// One or more destinations failed during a fan-out operation. `failures`
+/// pairs each failing destination's name with its error; destinations not
+/// listed here succeeded (and, per `MultiDestination`'s fail-fast contract,
+/// may have already committed independently).
+fn finish(total: usize, failures: Vec<(String, Error)>) -> Result<(), Error> {
     if failures.is_empty() {
         Ok(())
     } else {
         let succeeded = total - failures.len();
-        Err(SinkError::MultiDestination { failures, succeeded })
+        let detail = failures
+            .iter()
+            .map(|(name, err)| format!("{name}: {err}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(Error::new_internal(
+            CODE_DESTINATIONS_FAILED.clone(),
+            format!("{} of {} destinations failed: {detail}", failures.len(), failures.len() + succeeded),
+        ))
     }
 }
 
 #[async_trait]
 impl Destination for MultiDestination {
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<(), SinkError> {
+    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<(), Error> {
         let mut set = JoinSet::new();
         for mut writer in self.writers.drain(..) {
             let stream = stream.clone();
@@ -76,7 +97,7 @@ impl Destination for MultiDestination {
         finish(total, failures)
     }
 
-    async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), SinkError> {
+    async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), Error> {
         let mut set = JoinSet::new();
         for mut writer in self.writers.drain(..) {
             let stream = stream.clone();
@@ -92,7 +113,7 @@ impl Destination for MultiDestination {
         finish(total, failures)
     }
 
-    async fn evolve_schema(&mut self, stream: &StreamId, new_schema: &IcebergSchema) -> Result<(), SinkError> {
+    async fn evolve_schema(&mut self, stream: &StreamId, new_schema: &IcebergSchema) -> Result<(), Error> {
         let mut set = JoinSet::new();
         for mut writer in self.writers.drain(..) {
             let stream = stream.clone();
@@ -108,7 +129,7 @@ impl Destination for MultiDestination {
         finish(total, failures)
     }
 
-    async fn close(&mut self, stream: &StreamId) -> Result<(), SinkError> {
+    async fn close(&mut self, stream: &StreamId) -> Result<(), Error> {
         let mut set = JoinSet::new();
         for mut writer in self.writers.drain(..) {
             let stream = stream.clone();

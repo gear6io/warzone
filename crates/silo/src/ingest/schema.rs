@@ -1,7 +1,13 @@
+use std::sync::LazyLock;
+
 use arrow_schema::Schema as ArrowSchema;
+use errors::{Code, Error};
 use iceberg::spec::Schema as IcebergSchema;
 
-use crate::SinkError;
+use crate::wrap_iceberg;
+
+static CODE_INCOMING_SCHEMA_CONVERSION_FAILED: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("incoming_schema_conversion_failed"));
 
 /// Converts an Arrow schema (as carried by an incoming `RecordBatch`) into
 /// an Iceberg schema, via iceberg-rust's own conversion — field-ID/type
@@ -13,8 +19,10 @@ use crate::SinkError;
 /// (e.g. from a DB connector) won't have. Auto-assignment is exactly what
 /// iceberg-rust recommends for "schemas that don't originate from Iceberg
 /// tables".
-pub fn to_iceberg_schema(schema: &ArrowSchema) -> Result<IcebergSchema, SinkError> {
-    Ok(iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema)?)
+pub fn to_iceberg_schema(schema: &ArrowSchema) -> Result<IcebergSchema, Error> {
+    iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema).map_err(|e| {
+        wrap_iceberg(e, CODE_INCOMING_SCHEMA_CONVERSION_FAILED.clone(), "failed to convert Arrow schema to Iceberg")
+    })
 }
 
 /// Names present in `incoming` but missing from `current`. Empty means no
