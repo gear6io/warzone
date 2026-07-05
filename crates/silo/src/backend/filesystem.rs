@@ -5,7 +5,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
 use iceberg::io::LocalFsStorageFactory;
 use iceberg::spec::Schema as IcebergSchema;
@@ -13,7 +12,7 @@ use iceberg::spec::Schema as IcebergSchema;
 use errors::{Code, Error};
 
 use super::common::{build_catalog, IcebergBackend};
-use super::DestinationWriter;
+use super::{DestinationWriter, WriteSession};
 use crate::config::{CatalogConfig, StorageConfig};
 use crate::StreamId;
 
@@ -50,8 +49,8 @@ impl DestinationWriter for FilesystemDestinationWriter {
         self.inner.ensure_table(stream, schema).await
     }
 
-    async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), Error> {
-        self.inner.write(stream, batch).await
+    async fn begin_write(&mut self, stream: &StreamId) -> Result<Box<dyn WriteSession>, Error> {
+        Ok(Box::new(self.inner.begin_write(stream).await?))
     }
 
     async fn evolve_schema(&mut self, stream: &StreamId, new_schema: &IcebergSchema) -> Result<IcebergSchema, Error> {

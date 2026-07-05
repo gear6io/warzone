@@ -1,7 +1,7 @@
 //! No-infra tests: `MemoryCatalog` (in-memory metadata) + `LocalFsStorage`
 //! (`file://` on a tempdir) exercises the full
-//! `TableSink -> Destination -> DestinationWriter` path without any real
-//! cloud/service dependency.
+//! `TableSink -> Destination -> DestinationWriter` streaming-session path
+//! without any real cloud/service dependency.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use errors::{Code, Error};
 use iceberg::spec::Schema as IcebergSchema;
 use silo::backend::filesystem::FilesystemDestinationWriter;
-use silo::backend::DestinationWriter;
+use silo::backend::{DestinationWriter, WriteSession};
 use silo::config::CatalogConfig;
 use silo::destination::{Destination, MultiDestination, SingleDestination};
 use silo::ingest::{IcebergTableSink, TableSink};
@@ -59,7 +59,9 @@ async fn single_destination_writes_a_parquet_file_to_disk() {
     let iceberg_schema = silo::ingest::schema::to_iceberg_schema(batch.schema().as_ref()).unwrap();
 
     sink.setup(&stream, &iceberg_schema).await.unwrap();
-    sink.write(&stream, batch).await.unwrap();
+    let mut session = sink.begin_write(&stream).await.unwrap();
+    session.write(batch).await.unwrap();
+    session.commit().await.unwrap();
     sink.close(&stream).await.unwrap();
 
     assert_eq!(count_files_with_ext(warehouse.path(), "parquet"), 1);
@@ -93,16 +95,53 @@ async fn multi_destination_fans_out_to_both_backends() {
     let iceberg_schema = silo::ingest::schema::to_iceberg_schema(batch.schema().as_ref()).unwrap();
 
     sink.setup(&stream, &iceberg_schema).await.unwrap();
-    sink.write(&stream, batch).await.unwrap();
+    let mut session = sink.begin_write(&stream).await.unwrap();
+    session.write(batch).await.unwrap();
+    session.commit().await.unwrap();
     sink.close(&stream).await.unwrap();
 
     assert_eq!(count_files_with_ext(warehouse_a.path(), "parquet"), 1);
     assert_eq!(count_files_with_ext(warehouse_b.path(), "parquet"), 1);
 }
 
-/// Test double that always fails `write`, used to verify fail-fast surfacing
-/// and that a sibling destination's independent commit isn't undone.
-struct FailingWriter;
+/// Fake session for [`FailingWriter`]: never touches disk, just fails
+/// `write` once `should_fail` is set.
+struct FailingSession {
+    should_fail: bool,
+}
+
+#[async_trait]
+impl WriteSession for FailingSession {
+    async fn write(&mut self, _batch: RecordBatch) -> Result<(), Error> {
+        if self.should_fail {
+            Err(Error::new_internal(Code::INTERNAL, "boom"))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Test double whose session succeeds on the first `begin_write` and fails
+/// every `write` from the second `begin_write` onward. Used to verify
+/// fail-fast surfacing and that an already-committed sibling from an
+/// earlier, separate call isn't retroactively undone by a later failure.
+struct FailingWriter {
+    begin_write_calls: usize,
+}
+
+impl FailingWriter {
+    fn new() -> Self {
+        Self { begin_write_calls: 0 }
+    }
+}
 
 #[async_trait]
 impl DestinationWriter for FailingWriter {
@@ -114,8 +153,9 @@ impl DestinationWriter for FailingWriter {
         Ok(schema.clone())
     }
 
-    async fn write(&mut self, _stream: &StreamId, _batch: &RecordBatch) -> Result<(), Error> {
-        Err(Error::new_internal(Code::INTERNAL, "boom"))
+    async fn begin_write(&mut self, _stream: &StreamId) -> Result<Box<dyn WriteSession>, Error> {
+        self.begin_write_calls += 1;
+        Ok(Box::new(FailingSession { should_fail: self.begin_write_calls > 1 }))
     }
 
     async fn evolve_schema(&mut self, _stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
@@ -142,7 +182,7 @@ async fn multi_destination_fail_fast_does_not_undo_sibling_commit() {
     .await
     .unwrap();
 
-    let mut destination = MultiDestination::new(vec![Box::new(good_writer), Box::new(FailingWriter)]);
+    let mut destination = MultiDestination::new(vec![Box::new(good_writer), Box::new(FailingWriter::new())]);
 
     let stream = StreamId::new(["ns"], "events");
     let batch = sample_batch();
@@ -150,10 +190,48 @@ async fn multi_destination_fail_fast_does_not_undo_sibling_commit() {
 
     destination.ensure_table(&stream, &iceberg_schema).await.unwrap();
 
-    let result = destination.write(&stream, &batch).await;
-    assert!(result.is_err(), "expected the failing destination to surface an error");
+    // Call #1: FailingWriter's first session succeeds, so both destinations
+    // commit. This durable commit must never be undone by a later failure.
+    let mut session = destination.begin_write(&stream).await.unwrap();
+    session.write(&batch).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(count_files_with_ext(warehouse.path(), "parquet"), 1, "call #1 should commit exactly one file");
 
-    // The healthy destination's independent commit still landed on disk —
-    // fail-fast surfaces the error, it doesn't roll anything back.
+    // Call #2: FailingWriter's second session fails on write. The good
+    // destination's same-call partial file must be cleaned up by abort.
+    let mut session = destination.begin_write(&stream).await.unwrap();
+    let write_result = session.write(&batch).await;
+    assert!(write_result.is_err(), "expected the failing destination to surface an error");
+    session.abort().await.unwrap();
+
+    // Exactly one file survives: call #1's commit wasn't undone, and call
+    // #2's aborted partial file didn't leak.
     assert_eq!(count_files_with_ext(warehouse.path(), "parquet"), 1);
+}
+
+#[tokio::test]
+async fn ingest_session_abort_leaves_no_partial_parquet_file() {
+    let warehouse = tempfile::tempdir().unwrap();
+    let catalog_cfg = memory_catalog_config(warehouse.path());
+    let storage_cfg = silo::config::StorageConfig::FileSystem { root_path: warehouse.path().display().to_string() };
+
+    let writer = FilesystemDestinationWriter::new("primary".into(), &catalog_cfg, storage_cfg).await.unwrap();
+    let mut sink = IcebergTableSink::new(Box::new(SingleDestination::new(Box::new(writer))));
+
+    let stream = StreamId::new(["ns"], "events");
+    let batch = sample_batch();
+    let iceberg_schema = silo::ingest::schema::to_iceberg_schema(batch.schema().as_ref()).unwrap();
+
+    sink.setup(&stream, &iceberg_schema).await.unwrap();
+    let mut session = sink.begin_write(&stream).await.unwrap();
+    session.write(batch).await.unwrap();
+
+    // The write already landed bytes in a physical (uncommitted) Parquet
+    // file — confirm that before aborting, so this test isn't vacuously
+    // passing because no file was ever created.
+    assert_eq!(count_files_with_ext(warehouse.path(), "parquet"), 1, "write() should have opened a partial file");
+
+    session.abort().await.unwrap();
+
+    assert_eq!(count_files_with_ext(warehouse.path(), "parquet"), 0, "abort() should have deleted the partial file");
 }

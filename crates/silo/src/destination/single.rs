@@ -4,8 +4,8 @@ use iceberg::spec::Schema as IcebergSchema;
 
 use errors::Error;
 
-use super::Destination;
-use crate::backend::DestinationWriter;
+use super::{Destination, DestinationSession};
+use crate::backend::{DestinationWriter, WriteSession};
 use crate::StreamId;
 
 /// One destination, no fan-out.
@@ -25,8 +25,9 @@ impl Destination for SingleDestination {
         self.writer.ensure_table(stream, schema).await.map(|_| ())
     }
 
-    async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), Error> {
-        self.writer.write(stream, batch).await
+    async fn begin_write(&mut self, stream: &StreamId) -> Result<Box<dyn DestinationSession>, Error> {
+        let session = self.writer.begin_write(stream).await?;
+        Ok(Box::new(SingleWriteSession { session }))
     }
 
     async fn evolve_schema(&mut self, stream: &StreamId, new_schema: &IcebergSchema) -> Result<(), Error> {
@@ -35,5 +36,24 @@ impl Destination for SingleDestination {
 
     async fn close(&mut self, stream: &StreamId) -> Result<(), Error> {
         self.writer.close(stream).await
+    }
+}
+
+struct SingleWriteSession {
+    session: Box<dyn WriteSession>,
+}
+
+#[async_trait]
+impl DestinationSession for SingleWriteSession {
+    async fn write(&mut self, batch: &RecordBatch) -> Result<(), Error> {
+        self.session.write(batch.clone()).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        self.session.commit().await
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), Error> {
+        self.session.abort().await
     }
 }

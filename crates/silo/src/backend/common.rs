@@ -1,41 +1,34 @@
 //! Shared Catalog/Table plumbing used by every [`super::DestinationWriter`]
 //! impl. Backends differ only in which `StorageFactory` + storage props they
 //! hand to [`build_catalog`]; everything past "have a `Catalog`" (namespace
-//! bootstrap, table load/create, Parquet write, fast-append commit) is
-//! identical, so it lives here once instead of being duplicated per backend.
+//! bootstrap, table load/create, streaming Parquet write session,
+//! fast-append commit) is identical, so it lives here once instead of being
+//! duplicated per backend.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use arrow_array::RecordBatch;
 use iceberg::io::StorageFactory;
-use iceberg::spec::{DataFileFormat, Schema as IcebergSchema};
+use iceberg::spec::Schema as IcebergSchema;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
-use parquet::file::properties::WriterProperties;
 
 use errors::{Code, Error};
 
+use super::parquet_writer::ParquetFileWriter;
+use super::WriteSession;
 use crate::config::CatalogConfig;
 use crate::{wrap_iceberg, StreamId};
+use async_trait::async_trait;
 
 static CODE_CATALOG_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("catalog_load_failed"));
 static CODE_INVALID_STREAM_IDENTIFIER: LazyLock<Code> = LazyLock::new(|| Code::must_new("invalid_stream_identifier"));
 static CODE_NAMESPACE_SETUP_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("namespace_setup_failed"));
 static CODE_TABLE_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_load_failed"));
 static CODE_UNKNOWN_STREAM: LazyLock<Code> = LazyLock::new(|| Code::must_new("unknown_stream"));
-static CODE_SCHEMA_CONVERSION_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("schema_conversion_failed"));
-static CODE_BATCH_RETAG_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("batch_retag_failed"));
-static CODE_PARQUET_WRITE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("parquet_write_failed"));
 static CODE_TABLE_COMMIT_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_commit_failed"));
 static CODE_SCHEMA_EVOLUTION_UNSUPPORTED: LazyLock<Code> =
     LazyLock::new(|| Code::must_new("schema_evolution_unsupported"));
@@ -82,7 +75,7 @@ pub(crate) async fn build_catalog(
 pub(crate) struct IcebergBackend {
     name: String,
     catalog: Arc<dyn Catalog>,
-    tables: HashMap<StreamId, Table>,
+    tables: HashMap<StreamId, Arc<Mutex<Table>>>,
 }
 
 impl IcebergBackend {
@@ -133,68 +126,19 @@ impl IcebergBackend {
         };
 
         let current_schema = table.metadata().current_schema().as_ref().clone();
-        self.tables.insert(stream.clone(), table);
+        self.tables.insert(stream.clone(), Arc::new(Mutex::new(table)));
         Ok(current_schema)
     }
 
-    pub(crate) async fn write(&mut self, stream: &StreamId, batch: &RecordBatch) -> Result<(), Error> {
-        let table = self
+    pub(crate) async fn begin_write(&mut self, stream: &StreamId) -> Result<IcebergWriteSession, Error> {
+        let cell = self
             .tables
             .get(stream)
             .ok_or_else(|| Error::new_not_found(CODE_UNKNOWN_STREAM.clone(), format!("unknown stream {stream:?}")))?
             .clone();
-
-        // The incoming batch's Arrow schema generally has no Iceberg
-        // field-id metadata (it comes from the source, not from this
-        // table), but iceberg-rust's Parquet writer requires each column to
-        // carry a `PARQUET:field_id` matching the table's schema. Re-tag the
-        // batch against the table's own current schema (the source of
-        // truth for field ids) rather than trying to invent ids ourselves.
-        let arrow_schema_with_ids = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).map_err(|e| {
-                wrap_iceberg(e, CODE_SCHEMA_CONVERSION_FAILED.clone(), "failed to convert table schema to Arrow")
-            })?,
-        );
-        let batch = RecordBatch::try_new(arrow_schema_with_ids, batch.columns().to_vec()).map_err(|e| {
-            Error::wrap_internal(
-                e,
-                CODE_BATCH_RETAG_FAILED.clone(),
-                "failed to retag record batch with table field ids",
-            )
-        })?;
-
-        // ponytail: one Parquet file + one commit per write() call — simplest
-        // correct thing. Batch multiple writes into one transaction/file when
-        // commit-frequency or small-file-count actually becomes a problem.
-        let parquet_write_failed =
-            |e| wrap_iceberg(e, CODE_PARQUET_WRITE_FAILED.clone(), "failed to write Parquet data file");
-        let location_generator =
-            DefaultLocationGenerator::new(table.metadata().clone()).map_err(parquet_write_failed)?;
-        let file_name_generator =
-            DefaultFileNameGenerator::new("data".to_string(), None, DataFileFormat::Parquet);
-        let parquet_writer_builder = ParquetWriterBuilder::new(
-            WriterProperties::default(),
-            table.metadata().current_schema().clone(),
-        );
-        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
-            parquet_writer_builder,
-            table.file_io().clone(),
-            location_generator,
-            file_name_generator,
-        );
-        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
-        let mut writer = data_file_writer_builder.build(None).await.map_err(parquet_write_failed)?;
-        writer.write(batch).await.map_err(parquet_write_failed)?;
-        let data_files = writer.close().await.map_err(parquet_write_failed)?;
-
-        let table_commit_failed =
-            |e| wrap_iceberg(e, CODE_TABLE_COMMIT_FAILED.clone(), "failed to commit fast-append transaction");
-        let tx = Transaction::new(&table);
-        let tx = tx.fast_append().add_data_files(data_files).apply(tx).map_err(table_commit_failed)?;
-        let updated_table = tx.commit(self.catalog.as_ref()).await.map_err(table_commit_failed)?;
-
-        self.tables.insert(stream.clone(), updated_table);
-        Ok(())
+        let table = cell.lock().unwrap().clone();
+        let writer = ParquetFileWriter::new(&table).await?;
+        Ok(IcebergWriteSession { catalog: self.catalog.clone(), table, table_cell: cell, writer })
     }
 
     /// iceberg-rust 0.9.1 exposes no public way to evolve an existing table's
@@ -223,5 +167,43 @@ impl IcebergBackend {
             .await
             .map_err(|e| wrap_iceberg(e, CODE_CATALOG_CHECK_FAILED.clone(), "connectivity/permissions check failed"))?;
         Ok(())
+    }
+}
+
+/// One streaming write session against one Iceberg table: a
+/// [`ParquetFileWriter`] to accumulate records, plus what's needed to
+/// fast-append it on `commit` — the `Table` snapshot the session was
+/// opened against, the catalog to commit against, and the shared
+/// per-stream cell to write the post-commit `Table` back into (so the
+/// *next* session for this stream doesn't build its transaction against
+/// stale metadata and get rejected as a conflict).
+pub(crate) struct IcebergWriteSession {
+    catalog: Arc<dyn Catalog>,
+    table: Table,
+    table_cell: Arc<Mutex<Table>>,
+    writer: ParquetFileWriter,
+}
+
+#[async_trait]
+impl WriteSession for IcebergWriteSession {
+    async fn write(&mut self, batch: RecordBatch) -> Result<(), Error> {
+        self.writer.write(batch).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<(), Error> {
+        let data_files = self.writer.finish().await?;
+
+        let table_commit_failed =
+            |e| wrap_iceberg(e, CODE_TABLE_COMMIT_FAILED.clone(), "failed to commit fast-append transaction");
+        let tx = Transaction::new(&self.table);
+        let tx = tx.fast_append().add_data_files(data_files).apply(tx).map_err(table_commit_failed)?;
+        let updated_table = tx.commit(self.catalog.as_ref()).await.map_err(table_commit_failed)?;
+
+        *self.table_cell.lock().unwrap() = updated_table;
+        Ok(())
+    }
+
+    async fn abort(self: Box<Self>) -> Result<(), Error> {
+        self.writer.abort().await
     }
 }
