@@ -814,6 +814,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "errors"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "event-listener"
 version = "5.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
