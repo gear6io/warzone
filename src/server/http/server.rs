@@ -1,14 +1,14 @@
 use axum::Router;
 use tokio::net::TcpListener;
 
-use crate::server::http::v1;
+use crate::{config::HttpServerConfig, server::http::v1};
 
-const ADDRESS: &str = "127.0.0.1:3000";
+const ADDRESS: &str = "127.0.0.1";
 
-pub async fn serve() -> std::io::Result<()> {
+pub async fn serve(config: HttpServerConfig) -> std::io::Result<()> {
     let router = api_router();
 
-    let listener = TcpListener::bind(ADDRESS).await?;
+    let listener = TcpListener::bind(format!("{ADDRESS}:{}", config.port)).await?;
 
     println!("Server running at {ADDRESS}");
     axum::serve(listener, router).await
