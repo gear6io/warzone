@@ -1,5 +1,6 @@
 target/
 .vscode/
 .venv/
+dev/data/
 # Added by code-review-graph
 .code-review-graph/

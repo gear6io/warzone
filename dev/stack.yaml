@@ -1,0 +1,36 @@
+# Tier 2 — realistic stack config. `make run-stack` uses this.
+#
+# Talks to the docker-compose stack (`make dev-up`): Apache Polaris as the
+# Iceberg REST catalog and SeaweedFS as the S3-compatible object store.
+# Bring the stack up first — it creates the `warehouse` bucket and the
+# `warzone` Polaris catalog (see dev/init.sh).
+#
+# Unlike Tier 1, tables are catalog-registered, so catalog-qualified SQL
+# works: SELECT * FROM warzone.<namespace>.<table>
+
+service:
+  - !Http
+    port: 3886
+  - !PgWire
+
+silo:
+  batch_size: 10000
+  destinations:
+    - name: warzone
+      catalog:
+        type: rest
+        uri: "http://localhost:8181/api/catalog"
+        warehouse: "warzone" # Polaris catalog name
+        # Polaris uses OAuth2 client-credentials, not a static token.
+        credential: "root:s3cr3t"
+        oauth2-server-uri: "http://localhost:8181/api/catalog/v1/oauth/tokens"
+        scope: "PRINCIPAL_ROLE:ALL"
+      storage:
+        # Generic S3 variant (not the `minio` preset) pointed at SeaweedFS.
+        type: s3
+        bucket: "warehouse"
+        endpoint: "http://localhost:8333"
+        region: "us-east-1"
+        path_style: true
+        access_key_id: "warzone"
+        secret_access_key: "warzone"

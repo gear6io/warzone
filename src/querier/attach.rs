@@ -7,7 +7,7 @@ use errors::Error;
 /// express. Anything else in `CatalogConfig::Rest.props` is rejected loudly
 /// rather than silently dropped — iceberg-rust's REST client accepts an
 /// arbitrary props map, DuckDB's iceberg extension does not.
-const KNOWN_REST_PROPS: &[&str] = &["token", "oauth2-server-uri", "warehouse"];
+const KNOWN_REST_PROPS: &[&str] = &["token", "oauth2-server-uri", "warehouse", "credential", "scope"];
 
 /// Turns a valid DuckDB identifier out of a destination name (spaces/dashes
 /// etc. aren't valid unquoted identifiers, and we don't want to have to
@@ -40,17 +40,15 @@ pub(crate) fn attach_statements(destinations: &[DestinationConfig]) -> Result<Ve
         statements.push("LOAD httpfs;".to_string());
     }
 
-    for (i, destination) in destinations.iter().enumerate() {
+    for destination in destinations {
         let name = catalog_name(&destination.name);
         if let Some(secret) = s3_secret_statement(&name, destination.storage.clone())? {
             statements.push(secret);
         }
-        if let Some(attach) = attach_statement(&name, &destination.catalog)? {
-            statements.push(attach);
-            if i == 0 {
-                statements.push(format!("USE {name};"));
-            }
-        }
+        // No `USE <catalog>`: DuckDB's bare `USE` needs a catalog with a default schema,
+        // which iceberg REST catalogs (the only kind we ATTACH) don't have — it errors
+        // "No catalog + schema named ...". Tables are addressed `<catalog>.<ns>.<table>`.
+        statements.extend(attach_statements_for_catalog(&name, &destination.catalog)?);
     }
 
     Ok(statements)
@@ -68,7 +66,16 @@ fn s3_secret_statement(catalog: &str, storage: StorageConfig) -> Result<Option<S
         opts.push(format!("REGION '{}'", escape(&region)));
     }
     if let Some(endpoint) = endpoint {
-        opts.push(format!("ENDPOINT '{}'", escape(&endpoint)));
+        // DuckDB's S3 ENDPOINT is a bare `host:port`; it prepends the scheme itself
+        // (https unless USE_SSL is false). A leading `http(s)://` here produces a broken
+        // `https://http://host` URL, so strip it and drive USE_SSL from it. iceberg-rust
+        // (silo's write path) wants the full URL, so config keeps the scheme; we strip here.
+        let (host, use_ssl) = match endpoint.strip_prefix("http://") {
+            Some(host) => (host, false),
+            None => (endpoint.strip_prefix("https://").unwrap_or(&endpoint), true),
+        };
+        opts.push(format!("ENDPOINT '{}'", escape(host)));
+        opts.push(format!("USE_SSL {use_ssl}"));
     }
     if let Some(key) = access_key_id {
         opts.push(format!("KEY_ID '{}'", escape(&key)));
@@ -80,9 +87,13 @@ fn s3_secret_statement(catalog: &str, storage: StorageConfig) -> Result<Option<S
     Ok(Some(format!("CREATE SECRET {catalog}_s3 ({});", opts.join(", "))))
 }
 
-fn attach_statement(catalog: &str, config: &CatalogConfig) -> Result<Option<String>, Error> {
+/// Statements to attach one REST/memory catalog. REST-with-OAuth returns two: a
+/// `CREATE SECRET ... (TYPE ICEBERG, ...)` holding the client credentials, then the
+/// `ATTACH` that references it by name — DuckDB's iceberg extension takes OAuth2
+/// client-credentials only via a named secret, not inline.
+fn attach_statements_for_catalog(catalog: &str, config: &CatalogConfig) -> Result<Vec<String>, Error> {
     match config {
-        CatalogConfig::Memory { .. } => Ok(None),
+        CatalogConfig::Memory { .. } => Ok(vec![]),
         CatalogConfig::Rest { uri, warehouse, props } => {
             for key in props.keys() {
                 if !KNOWN_REST_PROPS.contains(&key.as_str()) {
@@ -92,11 +103,35 @@ fn attach_statement(catalog: &str, config: &CatalogConfig) -> Result<Option<Stri
                     ));
                 }
             }
+            let mut statements = Vec::new();
             let mut opts = vec!["TYPE ICEBERG".to_string(), format!("ENDPOINT '{}'", escape(uri))];
             if let Some(token) = props.get("token") {
                 opts.push(format!("SECRET '{}'", escape(token)));
+            } else if let Some(credential) = props.get("credential") {
+                // iceberg REST `credential` is `client_id:client_secret`.
+                let (client_id, client_secret) = credential.split_once(':').ok_or_else(|| {
+                    Error::new_invalid_input(
+                        CODE_UNSUPPORTED_CATALOG_PROP.clone(),
+                        format!("catalog prop 'credential' must be 'client_id:client_secret', got '{credential}'"),
+                    )
+                })?;
+                let mut secret_opts = vec![
+                    "TYPE ICEBERG".to_string(),
+                    format!("CLIENT_ID '{}'", escape(client_id)),
+                    format!("CLIENT_SECRET '{}'", escape(client_secret)),
+                ];
+                if let Some(server_uri) = props.get("oauth2-server-uri") {
+                    secret_opts.push(format!("OAUTH2_SERVER_URI '{}'", escape(server_uri)));
+                }
+                if let Some(scope) = props.get("scope") {
+                    secret_opts.push(format!("OAUTH2_SCOPE '{}'", escape(scope)));
+                }
+                let secret_name = format!("{catalog}_iceberg");
+                statements.push(format!("CREATE SECRET {secret_name} ({});", secret_opts.join(", ")));
+                opts.push(format!("SECRET {secret_name}"));
             }
-            Ok(Some(format!("ATTACH '{}' AS {catalog} ({});", escape(warehouse), opts.join(", "))))
+            statements.push(format!("ATTACH '{}' AS {catalog} ({});", escape(warehouse), opts.join(", ")));
+            Ok(statements)
         }
     }
 }
@@ -141,7 +176,60 @@ mod tests {
         let statements = attach_statements(&destinations).unwrap();
         assert!(statements.iter().any(|s| s.starts_with("CREATE SECRET primary_s3_s3")));
         assert!(statements.iter().any(|s| s == "ATTACH 's3://warehouse' AS primary_s3 (TYPE ICEBERG, ENDPOINT 'http://localhost:8181');"));
-        assert!(statements.contains(&"USE primary_s3;".to_string()));
+        // No `USE`: bare USE fails on iceberg REST catalogs (no default schema).
+        assert!(statements.iter().all(|s| !s.starts_with("USE ")));
+    }
+
+    #[test]
+    fn s3_endpoint_scheme_becomes_use_ssl() {
+        let destinations = vec![dest(
+            "d",
+            CatalogConfig::Rest { uri: "http://c".into(), warehouse: "s3://w".into(), props: HashMap::new() },
+            StorageConfig::S3 {
+                bucket: "w".into(),
+                region: None,
+                endpoint: Some("http://localhost:8333".into()),
+                path_style: true,
+                access_key_id: None,
+                secret_access_key: None,
+            },
+        )];
+        let statements = attach_statements(&destinations).unwrap();
+        let secret = statements.iter().find(|s| s.starts_with("CREATE SECRET d_s3")).unwrap();
+        // scheme stripped from ENDPOINT, driven into USE_SSL — no `https://http://`.
+        assert!(secret.contains("ENDPOINT 'localhost:8333'"), "{secret}");
+        assert!(secret.contains("USE_SSL false"), "{secret}");
+    }
+
+    #[test]
+    fn rest_catalog_with_credential_emits_oauth_secret() {
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "root:s3cr3t".to_string());
+        props.insert("oauth2-server-uri".to_string(), "http://localhost:8181/oauth/tokens".to_string());
+        props.insert("scope".to_string(), "PRINCIPAL_ROLE:ALL".to_string());
+        let destinations = vec![dest(
+            "primary",
+            CatalogConfig::Rest { uri: "http://localhost:8181".into(), warehouse: "warzone".into(), props },
+            StorageConfig::Memory,
+        )];
+        let statements = attach_statements(&destinations).unwrap();
+        assert!(statements.iter().any(|s| s
+            == "CREATE SECRET primary_iceberg (TYPE ICEBERG, CLIENT_ID 'root', CLIENT_SECRET 's3cr3t', OAUTH2_SERVER_URI 'http://localhost:8181/oauth/tokens', OAUTH2_SCOPE 'PRINCIPAL_ROLE:ALL');"));
+        assert!(statements
+            .iter()
+            .any(|s| s == "ATTACH 'warzone' AS primary (TYPE ICEBERG, ENDPOINT 'http://localhost:8181', SECRET primary_iceberg);"));
+    }
+
+    #[test]
+    fn malformed_credential_is_rejected() {
+        let mut props = HashMap::new();
+        props.insert("credential".to_string(), "no-colon-here".to_string());
+        let destinations = vec![dest(
+            "primary",
+            CatalogConfig::Rest { uri: "http://localhost:8181".into(), warehouse: "warzone".into(), props },
+            StorageConfig::Memory,
+        )];
+        assert!(attach_statements(&destinations).is_err());
     }
 
     #[test]

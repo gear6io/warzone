@@ -4,6 +4,42 @@
 
 A PostgreSQL-compatible database that stores data natively as Apache Iceberg tables on Parquet. Goal: give developers a full database experience (SQL, transactions, wire protocol) while every byte lands in an open, engine-agnostic format — no separate catalog, compaction, or scheduling infrastructure to stand up.
 
+## Quickstart
+
+Prereqs: Rust stable (`cargo`) and Docker (only for the Tier 2 stack below).
+
+Zero-infra run — Iceberg/Parquet on the local filesystem, no Docker:
+
+```sh
+make run   # serves HTTP on :3886 and the Postgres wire protocol on :5432
+```
+
+In another terminal, insert a row, read it back, and query it over the
+Postgres wire protocol:
+
+```sh
+# insert
+curl -s -X POST localhost:3886/api/v1/insert \
+  -H 'content-type: application/json' \
+  -d '{"namespace":"demo","table":"events","data":{"id":1,"name":"hello"}}'
+
+# query (Tier 1 reads the parquet directly — see note below)
+curl -s -X POST localhost:3886/api/v1/query \
+  -H 'content-type: application/json' \
+  -d '{"sql":"SELECT * FROM read_parquet('\''dev/data/warehouse/demo/events/data/*.parquet'\'')"}'
+
+# same query over the Postgres wire protocol
+psql -h 127.0.0.1 -p 5432 -c \
+  "SELECT * FROM read_parquet('dev/data/warehouse/demo/events/data/*.parquet')"
+```
+
+Data lands under `dev/data/warehouse/` as real Iceberg tables + Parquet.
+Tier 1 uses an in-memory catalog, so tables aren't registered by name —
+read them via `read_parquet(...)`. For catalog-qualified SQL
+(`warehouse.demo.events`) against a real REST catalog + S3, use the Tier 2
+stack. Full guide, all `make` targets, and config reference:
+[docs/development.md](docs/development.md).
+
 ## Why
 
 Iceberg is becoming the standard open table format for lakehouses, but using it today means assembling and running your own catalog, query engine, object storage, compaction jobs, metadata cleanup, and orchestration. This project packages that stack behind a single database process, the same way PostgreSQL packages a storage engine and transaction manager behind a single process.
