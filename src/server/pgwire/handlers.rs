@@ -9,13 +9,10 @@ use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
 use pgwire::error::PgWireResult;
 
-use super::error::query_engine_not_implemented;
+use super::error::to_pgwire_error;
+use super::results::record_batches_to_query_response;
 use crate::silo::AppState;
 
-// ponytail: state isn't read yet — no query engine exists to hand it to.
-// Kept on the handler so the query-engine task can start reading tables
-// through the same `AppState` the write path already uses.
-#[allow(dead_code)]
 pub struct Handler {
     state: AppState,
 }
@@ -25,12 +22,13 @@ impl NoopStartupHandler for Handler {}
 
 #[async_trait]
 impl SimpleQueryHandler for Handler {
-    async fn do_query<C>(&self, _client: &mut C, _query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        Err(query_engine_not_implemented())
+        let result = self.state.querier.query(query).await.map_err(|e| to_pgwire_error(&e))?;
+        Ok(vec![Response::Query(record_batches_to_query_response(result)?)])
     }
 }
 

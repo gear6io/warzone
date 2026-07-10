@@ -12,6 +12,7 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct AppState {
     pub sink: Arc<Mutex<IcebergTableSink>>,
+    pub querier: Arc<crate::querier::QueryEngine>,
 }
 
 async fn build_writer(config: &DestinationConfig) -> Result<Box<dyn DestinationWriter>, Error> {
