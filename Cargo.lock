@@ -3346,6 +3346,8 @@ dependencies = [
 name = "warzone"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "axum",
  "clap",
  "errors",

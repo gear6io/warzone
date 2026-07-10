@@ -1,12 +1,12 @@
 use axum::Router;
 use tokio::net::TcpListener;
 
-use crate::{config::HttpServerConfig, server::http::v1};
+use crate::{config::HttpServerConfig, server::http::v1, silo::AppState};
 
 const ADDRESS: &str = "127.0.0.1";
 
-pub async fn serve(config: HttpServerConfig) -> std::io::Result<()> {
-    let router = api_router();
+pub async fn serve(config: HttpServerConfig, state: AppState) -> std::io::Result<()> {
+    let router = api_router(state);
 
     let listener = TcpListener::bind(format!("{ADDRESS}:{}", config.port)).await?;
 
@@ -14,7 +14,7 @@ pub async fn serve(config: HttpServerConfig) -> std::io::Result<()> {
     axum::serve(listener, router).await
 }
 
-fn api_router() -> Router {
-    let v1 = v1::router();
+fn api_router(state: AppState) -> Router {
+    let v1 = v1::router(state);
     return Router::new().nest("/api", v1)
 }
