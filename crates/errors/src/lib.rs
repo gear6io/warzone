@@ -36,6 +36,7 @@
 
 mod http;
 mod kind;
+mod pgwire;
 mod suggestions;
 
 use std::fmt;
@@ -43,6 +44,7 @@ use std::time::Duration;
 
 pub use http::{as_json, http_status, ErrorAdditional, Json, RetryJson};
 pub use kind::{Code, Type};
+pub use pgwire::sqlstate;
 pub use suggestions::{
     closest_levenshtein_match, new_suggestions_from_func, new_suggestions_on_levenshtein_distance,
     new_valid_references, NOUN_FIELDS, NOUN_KEYS, NOUN_REFERENCES,
