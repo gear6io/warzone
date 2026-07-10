@@ -1,0 +1,30 @@
+# Tier 1 — zero-infra local config. `make run` uses this.
+#
+# Memory catalog + local filesystem storage. No Docker, no S3, no REST
+# catalog. Data lands as real Iceberg/Parquet under dev/data/warehouse
+# (repo-local, gitignored). Paths are relative to the repo root — run from
+# there (the Makefile does).
+#
+# CAVEAT: the memory catalog holds table metadata in-process only. Parquet +
+# Iceberg metadata files persist on disk across restarts, but the catalog
+# does NOT re-attach them, so a restarted server can't see prior tables by
+# name. It's the only zero-infra option — CatalogConfig has no persistent
+# local variant. For catalog-qualified SQL (namespace.table) across restarts,
+# use Tier 2 (dev/stack.yaml). To read tier-1 data back, query the parquet
+# directly: SELECT * FROM read_parquet('dev/data/warehouse/<ns>/<table>/data/*.parquet')
+
+service:
+  - !Http
+    port: 3886
+  - !PgWire
+
+silo:
+  batch_size: 10000
+  destinations:
+    - name: local
+      catalog:
+        type: memory
+        warehouse: "dev/data/warehouse"
+      storage:
+        type: file_system
+        root_path: "dev/data/warehouse"

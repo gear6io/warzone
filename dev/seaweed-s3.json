@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "warzone",
+      "credentials": [
+        {
+          "accessKey": "warzone",
+          "secretKey": "warzone"
+        }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

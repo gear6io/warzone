@@ -2,12 +2,14 @@ use axum::{Router, routing::{get, post}};
 use crate::silo::AppState;
 mod payload;
 mod healthcheck;
+mod query;
 
 pub fn router(state: AppState) -> Router {
     let mut router: Router<AppState> = Router::new();
 
     let routes = vec![
         ("/insert", post(payload::accept_payload)),
+        ("/query", post(query::run_query)),
         ("/health", get(healthcheck::ready)),
     ];
 
