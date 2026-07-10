@@ -32,6 +32,7 @@ impl MustConfig for Config {
 #[derive(Debug, Deserialize)]
 pub enum ServerConfig {
     Http(HttpServerConfig),
+    PgWire,
 }
 
 impl MustConfig for ServerConfig {
@@ -40,6 +41,7 @@ impl MustConfig for ServerConfig {
             ServerConfig::Http(http_config) => {
                 http_config.apply_defaults();
             }
+            ServerConfig::PgWire => {}
         }
     }
 }

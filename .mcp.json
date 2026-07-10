@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "/Users/asthajyoti/code/warzone/.venv/bin/python3.14",
+      "args": [
+        "-m",
+        "code_review_graph",
+        "serve"
+      ],
+      "cwd": "/Users/asthajyoti/code/warzone",
+      "type": "stdio"
+    }
+  }
+}
