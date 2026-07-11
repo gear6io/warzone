@@ -2,15 +2,9 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-fn default_batch_size() -> usize {
-    10_000
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub destinations: Vec<DestinationConfig>,
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,12 +115,10 @@ mod tests {
                     "catalog": { "type": "memory", "warehouse": "file:///tmp/warehouse" },
                     "storage": { "type": "file_system", "root_path": "/tmp/warehouse" }
                 }
-            ],
-            "batch_size": 5000
+            ]
         });
 
         let config: SinkConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.destinations.len(), 2);
-        assert_eq!(config.batch_size, 5000);
     }
 }

@@ -16,8 +16,6 @@ use sqlparser::parser::Parser;
 
 // Re-export the AST + visitor surface. Consumers use `parser::ast::…` and the
 // visitor traits/helpers without pulling `sqlparser` into their own imports.
-// ponytail: no consumer yet in this binary crate, so these read as unused.
-#[allow(unused_imports)]
 pub use sqlparser::ast;
 #[allow(unused_imports)]
 pub use sqlparser::ast::{visit_relations, visit_statements, Statement, Visit, Visitor, VisitMut, VisitorMut};
@@ -29,8 +27,6 @@ static CODE_INVALID_SQL: LazyLock<Code> = LazyLock::new(|| Code::must_new("inval
 /// A `sqlparser::ParserError` is mapped to an `InvalidInput`-typed [`Error`] at
 /// this boundary — the same type the querier assigns to malformed SQL — so
 /// callers branch on `err.is_type(errors::Type::InvalidInput)` uniformly.
-// ponytail: no request-path caller yet; foundation module. Exercised by tests.
-#[allow(dead_code)]
 pub fn parse(sql: &str) -> Result<Vec<Statement>, Error> {
     Parser::parse_sql(&PostgreSqlDialect {}, sql)
         .map_err(|e| Error::wrap_invalid_input(e, CODE_INVALID_SQL.clone(), format!("invalid sql: {sql}")))

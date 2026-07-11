@@ -19,7 +19,6 @@ service:
   - !PgWire
 
 silo:
-  batch_size: 10000
   destinations:
     - name: local
       catalog:

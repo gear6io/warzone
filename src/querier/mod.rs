@@ -72,7 +72,6 @@ mod tests {
                 catalog: CatalogConfig::Memory { warehouse: "file:///tmp/warehouse".to_string() },
                 storage: StorageConfig::Memory,
             }],
-            batch_size: 10_000,
         }
     }
 
