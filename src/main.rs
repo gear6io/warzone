@@ -1,4 +1,5 @@
 mod config;
+mod parser;
 mod querier;
 mod server;
 mod silo;
