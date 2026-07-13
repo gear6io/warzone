@@ -37,8 +37,32 @@ Data lands under `dev/data/warehouse/` as real Iceberg tables + Parquet.
 Tier 1 uses an in-memory catalog, so tables aren't registered by name —
 read them via `read_parquet(...)`. For catalog-qualified SQL
 (`warehouse.demo.events`) against a real REST catalog + S3, use the Tier 2
-stack. Full guide, all `make` targets, and config reference:
-[docs/development.md](docs/development.md).
+stack. Full guide and config reference: [docs/development.md](docs/development.md).
+
+## Playground
+
+The server ships a browser SQL playground at
+[localhost:3886/play](http://localhost:3886/play) — table list, query history,
+and results grid. `make load-dummy` seeds a `demo.trips` table to try it against.
+
+![warzone play — browser SQL playground](ui/images/readme.png)
+
+## Make targets
+
+Run `make help` to list these from the Makefile itself.
+
+| Target | What it does |
+| --- | --- |
+| `build` | `cargo build --workspace` |
+| `test` | Run all tests (infra-free) |
+| `fmt` | `cargo fmt --all` |
+| `lint` | Clippy, warnings as errors |
+| `run` | Tier 1: run against the zero-infra local config (`dev/local.yaml`) |
+| `dev-up` | Tier 2: start the Polaris + SeaweedFS stack (bucket + catalog created) |
+| `dev-down` | Tier 2: stop the stack and delete its volumes |
+| `run-stack` | Tier 2: run against the REST-catalog/S3 stack (needs `dev-up` first) |
+| `clean` | Remove Tier 1 local data (`dev/data/`) |
+| `load-dummy` | Ingest the dummy NYC-taxi dataset via `dev/scripts/ingestion` |
 
 ## Why
 

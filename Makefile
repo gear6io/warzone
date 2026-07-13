@@ -1,5 +1,5 @@
 # warzone dev commands. See docs/development.md for the full guide.
-.PHONY: build test fmt lint run dev-up dev-down run-stack clean-data help
+.PHONY: build test fmt lint run dev-up dev-down run-stack clean load-dummy help
 
 COMPOSE := docker compose -f dev/compose.yaml
 
@@ -34,5 +34,5 @@ run-stack: ## Tier 2: run against the REST-catalog/S3 stack (needs dev-up first)
 clean: ## Remove Tier 1 local data (dev/data/)
 	rm -rf dev/data/
 
-load-dummy:
+load-dummy: ## Ingest the dummy NYC-taxi dataset (demo.trips)
 	go run dev/scripts/ingestion/main.go
