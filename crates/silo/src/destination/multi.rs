@@ -13,6 +13,7 @@ use crate::StreamId;
 
 static CODE_DESTINATION_TASK_PANICKED: LazyLock<Code> = LazyLock::new(|| Code::must_new("destination_task_panicked"));
 static CODE_DESTINATIONS_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("destinations_failed"));
+static CODE_SCHEMA_DIVERGED: LazyLock<Code> = LazyLock::new(|| Code::must_new("destination_schema_diverged"));
 /// Fans the same call out to every configured destination writer.
 ///
 /// **Fail-fast, without cancellation.** All destinations for the *current*
@@ -46,14 +47,21 @@ impl MultiDestination {
     }
 }
 
-async fn join_all(
-    mut set: JoinSet<(Box<dyn DestinationWriter>, Result<(), Error>)>,
-) -> (Vec<Box<dyn DestinationWriter>>, Vec<(String, Error)>) {
+/// Generic over the per-writer success payload so the schema-returning
+/// fan-outs (`load_table`/`create_table`) can collect what each backend
+/// reported instead of throwing it away.
+async fn join_all<T: Send + 'static>(
+    mut set: JoinSet<(Box<dyn DestinationWriter>, Result<T, Error>)>,
+) -> (Vec<Box<dyn DestinationWriter>>, Vec<T>, Vec<(String, Error)>) {
     let mut writers = Vec::new();
+    let mut results = Vec::new();
     let mut failures = Vec::new();
     while let Some(joined) = set.join_next().await {
         match joined {
-            Ok((writer, Ok(()))) => writers.push(writer),
+            Ok((writer, Ok(value))) => {
+                results.push(value);
+                writers.push(writer);
+            }
             Ok((writer, Err(err))) => {
                 failures.push((writer.name().to_string(), err));
                 writers.push(writer);
@@ -64,7 +72,24 @@ async fn join_all(
             )),
         }
     }
-    (writers, failures)
+    (writers, results, failures)
+}
+
+/// Every destination must report the same schema for a stream. A backend
+/// quietly holding a different one would mistype every row we coerce against
+/// it, so divergence is an error, not a "pick one and hope".
+fn agree<T: PartialEq>(schemas: Vec<T>, stream: &StreamId) -> Result<Option<T>, Error> {
+    let mut iter = schemas.into_iter();
+    let Some(first) = iter.next() else {
+        return Ok(None);
+    };
+    if iter.any(|other| other != first) {
+        return Err(Error::new_internal(
+            CODE_SCHEMA_DIVERGED.clone(),
+            format!("destinations disagree on the schema of stream {stream:?}"),
+        ));
+    }
+    Ok(Some(first))
 }
 
 /// One or more destinations failed during a fan-out operation. `failures`
@@ -90,20 +115,42 @@ fn finish(total: usize, failures: Vec<(String, Error)>) -> Result<(), Error> {
 
 #[async_trait]
 impl Destination for MultiDestination {
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<(), Error> {
+    async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error> {
+        let mut set = JoinSet::new();
+        for mut writer in self.writers.drain(..) {
+            let stream = stream.clone();
+            set.spawn(async move {
+                let res = writer.load_table(&stream).await;
+                (writer, res)
+            });
+        }
+        let (writers, schemas, failures) = join_all(set).await;
+        let total = writers.len();
+        self.writers = writers;
+        finish(total, failures)?;
+        // Each backend reports Option<Schema>; they must agree on registered-ness
+        // and on the schema itself. `agree` collapses the outer Vec, leaving the
+        // per-backend Option as the answer.
+        Ok(agree(schemas, stream)?.flatten())
+    }
+
+    async fn create_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
         let mut set = JoinSet::new();
         for mut writer in self.writers.drain(..) {
             let stream = stream.clone();
             let schema = schema.clone();
             set.spawn(async move {
-                let res = writer.ensure_table(&stream, &schema).await.map(|_| ());
+                let res = writer.create_table(&stream, &schema).await;
                 (writer, res)
             });
         }
-        let (writers, failures) = join_all(set).await;
+        let (writers, schemas, failures) = join_all(set).await;
         let total = writers.len();
         self.writers = writers;
-        finish(total, failures)
+        finish(total, failures)?;
+        agree(schemas, stream)?.ok_or_else(|| {
+            Error::new_internal(CODE_DESTINATIONS_FAILED.clone(), "no destinations configured".to_string())
+        })
     }
 
     async fn begin_write(&mut self, stream: &StreamId) -> Result<Box<dyn DestinationSession>, Error> {
@@ -170,7 +217,7 @@ impl Destination for MultiDestination {
                 (writer, res)
             });
         }
-        let (writers, failures) = join_all(set).await;
+        let (writers, _, failures) = join_all(set).await;
         let total = writers.len();
         self.writers = writers;
         finish(total, failures)
@@ -185,7 +232,7 @@ impl Destination for MultiDestination {
                 (writer, res)
             });
         }
-        let (writers, failures) = join_all(set).await;
+        let (writers, _, failures) = join_all(set).await;
         let total = writers.len();
         self.writers = writers;
         finish(total, failures)

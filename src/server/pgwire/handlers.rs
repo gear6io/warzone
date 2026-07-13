@@ -1,5 +1,5 @@
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
@@ -14,10 +14,15 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::PgWireBackendMessage;
 
-use super::copy;
+use errors::{Code, Error};
+use silo::ingest::TableSink;
+
 use super::error::to_pgwire_error;
 use super::results::record_batches_to_query_response;
+use super::{copy, ddl};
 use crate::silo::AppState;
+
+static CODE_COPY_UNKNOWN_TABLE: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_unknown_table"));
 
 pub struct Handler {
     state: AppState,
@@ -41,20 +46,62 @@ impl SimpleQueryHandler for Handler {
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        // Intercept `COPY <table> FROM STDIN` and route it into the silo sink;
-        // everything else (reads, DDL, ...) goes to the querier unchanged.
-        match copy::detect(query).map_err(|e| to_pgwire_error(&e))? {
-            Some(state) => {
-                let columns = state.columns;
-                client.session_extensions().insert(state);
-                let response = CopyResponse::new(0, columns, stream::empty::<PgWireResult<CopyData>>());
-                Ok(vec![Response::CopyIn(response)])
-            }
-            None => {
-                let result = self.state.querier.query(query).await.map_err(|e| to_pgwire_error(&e))?;
-                Ok(vec![Response::Query(record_batches_to_query_response(result)?)])
-            }
+        // `CREATE TABLE` registers a schema with silo; `COPY ... FROM STDIN`
+        // ingests against an already-registered one. Everything else (reads,
+        // other DDL, ...) goes to the querier unchanged.
+        if let Some(plan) = ddl::detect(query).map_err(|e| to_pgwire_error(&e))? {
+            return self.create_table(plan).await;
         }
+        if let Some(plan) = copy::detect(query).map_err(|e| to_pgwire_error(&e))? {
+            return self.begin_copy(client, plan).await;
+        }
+
+        let result = self.state.querier.query(query).await.map_err(|e| to_pgwire_error(&e))?;
+        Ok(vec![Response::Query(record_batches_to_query_response(result)?)])
+    }
+}
+
+impl Handler {
+    async fn create_table(&self, plan: ddl::CreateTablePlan) -> PgWireResult<Vec<Response>> {
+        let mut sink = self.state.sink.lock().await;
+        let already_registered = sink
+            .schema(&plan.stream)
+            .await
+            .map_err(|e| to_pgwire_error(&e))?
+            .is_some();
+
+        // `register` errors on a duplicate by itself; the lookup above only
+        // exists so `IF NOT EXISTS` can turn that into a no-op.
+        if !(plan.if_not_exists && already_registered) {
+            sink.register(&plan.stream, &plan.columns)
+                .await
+                .map_err(|e| to_pgwire_error(&e))?;
+        }
+        Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
+    }
+
+    /// Resolve the COPY against the table's registered schema, then enter COPY-IN
+    /// mode. An unregistered table is an error here — ingest never creates one.
+    async fn begin_copy<C>(&self, client: &mut C, plan: copy::CopyPlan) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+    {
+        let schema = {
+            let mut sink = self.state.sink.lock().await;
+            sink.schema(&plan.stream).await.map_err(|e| to_pgwire_error(&e))?
+        };
+        let schema = schema.ok_or_else(|| {
+            to_pgwire_error(&Error::new_not_found(
+                CODE_COPY_UNKNOWN_TABLE.clone(),
+                format!("table {} does not exist — CREATE TABLE it first", plan.stream),
+            ))
+        })?;
+
+        let state = copy::CopyState::new(plan, &schema).map_err(|e| to_pgwire_error(&e))?;
+        let columns = state.columns;
+        client.session_extensions().insert(state);
+        Ok(vec![Response::CopyIn(CopyResponse::new(0, columns, stream::empty::<PgWireResult<CopyData>>()))])
     }
 }
 

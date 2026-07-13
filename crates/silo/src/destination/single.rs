@@ -21,8 +21,12 @@ impl SingleDestination {
 
 #[async_trait]
 impl Destination for SingleDestination {
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<(), Error> {
-        self.writer.ensure_table(stream, schema).await.map(|_| ())
+    async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error> {
+        self.writer.load_table(stream).await
+    }
+
+    async fn create_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
+        self.writer.create_table(stream, schema).await
     }
 
     async fn begin_write(&mut self, stream: &StreamId) -> Result<Box<dyn DestinationSession>, Error> {

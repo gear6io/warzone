@@ -2,9 +2,19 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+fn default_batch_size() -> usize {
+    10_000
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub destinations: Vec<DestinationConfig>,
+    /// Rows buffered before an ingest session flushes them as one Arrow
+    /// `RecordBatch` into its Parquet file. The single knob controlling how many
+    /// rows are ever held in memory during an ingest — see
+    /// [`crate::ingest::IngestSession::push`].
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

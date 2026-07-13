@@ -1,58 +1,62 @@
 //! `COPY <ns>.<table> FROM STDIN` ingest over the Postgres wire protocol.
 //!
-//! One COPY command = one silo ingest session: `begin_write` on the first data
-//! row, `write` a `RecordBatch` per arriving `CopyData` chunk, one `commit` at
-//! `CopyDone` — the stream closing is what commits the file, nothing else.
-//! Rows are never held back waiting for a row-count threshold. This collapses
-//! the HTTP one-row-per-request path
-//! ([crate::server::http::v1::payload]) — which is one Parquet file + one
-//! Iceberg snapshot per row — into one file + one snapshot per COPY, which is
-//! the throughput point of routing bulk ingest here.
+//! One COPY command = one silo ingest session: `begin_write` when the first row
+//! arrives, `push` per row, one `commit` at `CopyDone` — the stream closing is
+//! what commits the file, nothing else.
 //!
-//! ponytail: column types are inferred from the first data row (CSV/text are
-//! untyped on the wire) and then fixed for the whole COPY. This is lossy —
-//! `"01234"` becomes `Int64` and loses the leading zero, a first-row NULL
-//! pins the column to `Utf8`. Upgrade path: parse fields into the target
-//! table's already-known Iceberg column types instead of guessing (needs a
-//! schema accessor on `TableSink`). See docs/high-throughput-ingestion.mdx §5.
+//! **This module holds no rows and knows nothing about Arrow.** It parses wire
+//! bytes into `silo::ingest::Value`s against the table's *registered* column
+//! types and pushes them one at a time; how many rows get gathered into a
+//! columnar block before they reach Parquet is silo's business
+//! ([`silo::ingest::IngestSession::push`]). The only state that crosses a wire
+//! chunk here is `leftover` — at most one partial *line*, because a chunk can
+//! split mid-row.
+//!
+//! Types come from `CREATE TABLE` (see [`super::ddl`]), never from the data.
+//! The old code inferred them from the first row, which silently turned a CSV
+//! `01234` into the integer `1234`; against a registered `TEXT` column it now
+//! stays `"01234"`.
 //!
 //! ponytail: CSV field splitting is a plain delimiter split — no quoted-field
-//! or embedded-delimiter/newline handling. Add a real CSV reader if that
-//! matters.
+//! or embedded-delimiter/newline handling. Add a real CSV reader if that matters.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use tokio::sync::Mutex;
 
 use errors::{Code, Error};
-use silo::ingest::schema::to_iceberg_schema;
-use silo::ingest::{IcebergTableSink, IngestSession, TableSink};
+use silo::ingest::{Column, ColumnType, IcebergTableSink, IngestSession, TableSink, Value};
 use silo::StreamId;
 
 use crate::parser::ast::{CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource, CopyTarget, Statement};
 
+use super::stream_id;
+
+static CODE_COPY_UNSUPPORTED: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_unsupported"));
+static CODE_UNKNOWN_COLUMN: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_unknown_column"));
+static CODE_INVALID_UTF8: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_invalid_utf8"));
+static CODE_COLUMN_COUNT_MISMATCH: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_column_count_mismatch"));
+static CODE_PARSE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_parse_failed"));
+
 fn unsupported(what: String) -> Error {
-    Error::new_unsupported(Code::must_new("copy_unsupported"), format!("{what} is not supported"))
+    Error::new_unsupported(CODE_COPY_UNSUPPORTED.clone(), format!("{what} is not supported"))
 }
 
-/// Per-connection COPY state, stashed in the client's session extensions so it
-/// survives across `on_copy_data` / `on_copy_done` callbacks. Those extensions
-/// are a type-keyed map, so this newtype is what keys the entry — that, not
-/// encapsulation, is why it wraps the `Mutex` instead of the handler storing
-/// one directly.
-pub struct CopyState {
-    /// Column count advertised in `CopyInResponse`. Zero when the CSV header
-    /// has yet to supply the names — harmless for text-format COPY.
-    pub columns: usize,
-    pub inner: Mutex<CopyInner>,
+/// What a `COPY ... FROM STDIN` statement asks for, before the table's schema is
+/// known. [`CopyState::new`] resolves it against the registered schema.
+pub struct CopyPlan {
+    pub stream: StreamId,
+    /// The explicit column list, if the statement carried one. Empty means "the
+    /// table's columns" — supplied either by a CSV header or, failing that, by
+    /// the table's own column order.
+    columns: Vec<String>,
+    format: CopyFormat,
 }
 
 /// Detects a lone `COPY <table> FROM STDIN`. Returns `Ok(None)` for anything
 /// that is not one (including SQL that fails to parse — let the querier report
 /// it), and `Err` for a COPY-FROM-STDIN we recognize but cannot serve.
-pub fn detect(sql: &str) -> Result<Option<CopyState>, Error> {
+pub fn detect(sql: &str) -> Result<Option<CopyPlan>, Error> {
     let statements = match crate::parser::parse(sql) {
         Ok(statements) => statements,
         Err(_) => return Ok(None),
@@ -83,41 +87,10 @@ pub fn detect(sql: &str) -> Result<Option<CopyState>, Error> {
         return Err(unsupported("COPY FROM STDIN with inline values".to_string()));
     }
 
-    // namespace = all identifier parts but the last; table = the last.
-    let mut parts: Vec<String> = table_name
-        .0
-        .iter()
-        .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
-        .collect();
-    let table = parts.pop().ok_or_else(|| {
-        Error::new_invalid_input(Code::must_new("copy_missing_table"), "COPY target has no table name".to_string())
-    })?;
-    let stream = StreamId::new(parts, table);
-
-    let format = resolve_options(options, legacy_options)?;
-
-    let columns: Vec<String> = columns.iter().map(|ident| ident.value.clone()).collect();
-    if columns.is_empty() && !format.header {
-        return Err(Error::new_invalid_input(
-            Code::must_new("copy_columns_unknown"),
-            "COPY needs an explicit column list, e.g. COPY t (a, b) FROM STDIN, or CSV HEADER".to_string(),
-        ));
-    }
-
-    Ok(Some(CopyState {
-        columns: columns.len(),
-        inner: Mutex::new(CopyInner {
-            stream,
-            delimiter: format.delimiter,
-            null_marker: format.null_marker,
-            header_pending: format.header,
-            columns,
-            leftover: Vec::new(),
-            rows: Vec::new(),
-            schema: None,
-            session: None,
-            total: 0,
-        }),
+    Ok(Some(CopyPlan {
+        stream: stream_id(table_name)?,
+        columns: columns.iter().map(|ident| ident.value.clone()).collect(),
+        format: resolve_options(options, legacy_options)?,
     }))
 }
 
@@ -185,40 +158,98 @@ fn resolve_options(options: &[CopyOption], legacy_options: &[CopyLegacyOption]) 
     })
 }
 
+/// Per-connection COPY state, stashed in the client's session extensions so it
+/// survives across `on_copy_data` / `on_copy_done` callbacks. Those extensions
+/// are a type-keyed map, so this newtype is what keys the entry.
+pub struct CopyState {
+    /// Column count advertised in `CopyInResponse`.
+    pub columns: usize,
+    pub inner: Mutex<CopyInner>,
+}
+
+impl CopyState {
+    /// Resolve a parsed COPY against the table's registered schema: work out
+    /// which column of the table each wire field lands in.
+    pub fn new(plan: CopyPlan, schema: &[Column]) -> Result<Self, Error> {
+        // No explicit column list and no header to supply one: the wire fields
+        // are the table's columns, in the table's order (Postgres' default).
+        let targets = if plan.columns.is_empty() && !plan.format.header {
+            Some((0..schema.len()).collect())
+        } else if plan.columns.is_empty() {
+            None // the CSV header names them; resolved when that line arrives
+        } else {
+            Some(resolve_targets(&plan.columns, schema)?)
+        };
+
+        Ok(Self {
+            columns: targets.as_ref().map_or(0, Vec::len),
+            inner: Mutex::new(CopyInner {
+                stream: plan.stream,
+                delimiter: plan.format.delimiter,
+                null_marker: plan.format.null_marker,
+                header_pending: plan.format.header,
+                schema: schema.to_vec(),
+                targets,
+                leftover: Vec::new(),
+                session: None,
+                total: 0,
+            }),
+        })
+    }
+}
+
+/// Map each named column to its position in the table. An unknown column name is
+/// an error — Postgres would reject it, and silently dropping the field would
+/// shift every subsequent one into the wrong column.
+fn resolve_targets(names: &[String], schema: &[Column]) -> Result<Vec<usize>, Error> {
+    names
+        .iter()
+        .map(|name| {
+            schema.iter().position(|column| &column.name == name).ok_or_else(|| {
+                Error::new_invalid_input(
+                    CODE_UNKNOWN_COLUMN.clone(),
+                    format!("column '{name}' does not exist on this table"),
+                )
+            })
+        })
+        .collect()
+}
+
 pub struct CopyInner {
     stream: StreamId,
     delimiter: char,
     null_marker: String,
     header_pending: bool,
-    columns: Vec<String>,
+    /// The table's columns. A pushed row is always this wide, with columns the
+    /// COPY did not mention left `Null`.
+    schema: Vec<Column>,
+    /// Which column of `schema` each wire field fills, in wire order. `None` only
+    /// while a CSV header is still owed; the header names the columns.
+    targets: Option<Vec<usize>>,
+    /// The one thing that crosses a chunk boundary: at most one partial line.
     leftover: Vec<u8>,
-    rows: Vec<Vec<Option<String>>>,
-    /// Set once, from the first data row — fixes column types for the COPY.
-    schema: Option<Arc<ArrowSchema>>,
     session: Option<Box<dyn IngestSession>>,
     total: usize,
 }
 
 impl CopyInner {
-    /// Feed a chunk of raw COPY bytes: split off every complete line and
-    /// process it, keeping any partial trailing line in `leftover`. The chunk's
-    /// rows are written straight through — one `RecordBatch` per chunk.
+    /// Feed a chunk of raw COPY bytes: push every complete line it contains,
+    /// keeping only a partial trailing line for the next chunk.
     pub async fn on_data(&mut self, sink: &Arc<Mutex<IcebergTableSink>>, bytes: &[u8]) -> Result<(), Error> {
         self.leftover.extend_from_slice(bytes);
         while let Some(pos) = self.leftover.iter().position(|&b| b == b'\n') {
             let line: Vec<u8> = self.leftover.drain(..=pos).collect();
             self.process_line(sink, &line[..line.len() - 1]).await?;
         }
-        self.flush().await
+        Ok(())
     }
 
-    /// Stream closed: flush the trailing line, commit the file, report the row count.
+    /// Stream closed: push the trailing line, commit the file, report the count.
     pub async fn finish(&mut self, sink: &Arc<Mutex<IcebergTableSink>>) -> Result<usize, Error> {
         if !self.leftover.is_empty() {
             let line = std::mem::take(&mut self.leftover);
             self.process_line(sink, &line).await?;
         }
-        self.flush().await?;
         if let Some(session) = self.session.take() {
             session.commit().await?;
         }
@@ -229,30 +260,16 @@ impl CopyInner {
     ///
     /// TODO: this only runs on an explicit `CopyFail` message or a parse/write
     /// error. It does NOT run when the client's TCP connection drops mid-COPY
-    /// (psql killed, network cut, container evicted). pgwire's
-    /// `process_socket` loop just ends on a dead socket — no `CopyFail` frame
-    /// is synthesized — so the `CopyState` in the session extensions is
-    /// dropped, taking the open `Box<dyn IngestSession>` with it. Nothing in
-    /// `crates/silo/` implements `Drop`, so `IngestSession::abort` (which is
-    /// what deletes the partial Parquet file) never runs, and the half-written
-    /// file is orphaned in the warehouse. No catalog damage — the snapshot is
-    /// only committed at `CopyDone` — but the bytes leak, and a long-running
-    /// server accumulates them.
-    ///
-    /// Two possible fixes, neither done here:
-    ///  1. `impl Drop for IcebergIngestSession` — hard: `abort()` is async and
-    ///     takes `Box<Self>`, so it needs a `tokio::spawn` of the delete on a
-    ///     handle captured at construction, and a flag so an explicit
-    ///     commit/abort doesn't double-fire.
-    ///  2. Sweep orphans out-of-band: any data file under the table's data dir
-    ///     not referenced by a snapshot, older than some COPY-duration bound,
-    ///     is garbage. Fits with the background compaction that
-    ///     `docs/high-throughput-ingestion.mdx` already lists as planned.
-    ///
-    /// Also fix `docs/high-throughput-ingestion.mdx` §3 (claims "connection
-    /// drop → session.abort()") and its verification step 6 (asserts no
-    /// partial Parquet file after killing psql mid-COPY) — both are wrong
-    /// until one of the above lands.
+    /// (psql killed, network cut, container evicted). pgwire's `process_socket`
+    /// loop just ends on a dead socket — no `CopyFail` frame is synthesized — so
+    /// the `CopyState` is dropped, taking the open `Box<dyn IngestSession>` with
+    /// it. Nothing in `crates/silo/` implements `Drop`, so `IngestSession::abort`
+    /// (which deletes the partial Parquet file) never runs and the half-written
+    /// file is orphaned. No catalog damage — the snapshot is only committed at
+    /// `CopyDone` — but the bytes leak, and a long-running server accumulates
+    /// them. Fix by either implementing `Drop` (awkward: `abort` is async and
+    /// takes `Box<Self>`) or sweeping unreferenced data files out-of-band, which
+    /// fits with the background compaction already planned.
     pub async fn abort(&mut self) {
         if let Some(session) = self.session.take() {
             let _ = session.abort().await;
@@ -260,144 +277,69 @@ impl CopyInner {
     }
 
     async fn process_line(&mut self, sink: &Arc<Mutex<IcebergTableSink>>, line: &[u8]) -> Result<(), Error> {
-        // An empty line is not "nothing": in text format it is a one-column row
-        // holding the empty string. Feeding it through the field split below
-        // either accepts it as that row or trips the column-count check — both
-        // beat dropping it and reporting a row count that does not match what
-        // the client sent.
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         let text = std::str::from_utf8(line).map_err(|e| {
-            Error::wrap_invalid_input(e, Code::must_new("copy_invalid_utf8"), "COPY data is not valid UTF-8")
+            Error::wrap_invalid_input(e, CODE_INVALID_UTF8.clone(), "COPY data is not valid UTF-8")
         })?;
 
         if self.header_pending {
-            if self.columns.is_empty() {
-                self.columns = text.split(self.delimiter).map(|f| f.to_string()).collect();
-            }
             self.header_pending = false;
+            if self.targets.is_none() {
+                let names: Vec<String> = text.split(self.delimiter).map(str::to_string).collect();
+                self.targets = Some(resolve_targets(&names, &self.schema)?);
+            }
             return Ok(());
         }
 
-        let fields: Vec<Option<String>> = text
-            .split(self.delimiter)
-            .map(|f| if f == self.null_marker { None } else { Some(f.to_string()) })
-            .collect();
-        if fields.len() != self.columns.len() {
+        let targets = self.targets.as_deref().expect("targets are resolved before any data line");
+        let fields: Vec<&str> = text.split(self.delimiter).collect();
+        if fields.len() != targets.len() {
             return Err(Error::new_invalid_input(
-                Code::must_new("copy_column_count_mismatch"),
-                format!("COPY row has {} fields but {} columns were declared", fields.len(), self.columns.len()),
+                CODE_COLUMN_COUNT_MISMATCH.clone(),
+                format!("COPY row has {} fields but {} columns were declared", fields.len(), targets.len()),
             ));
         }
 
-        if self.schema.is_none() {
-            self.setup(sink, &fields).await?;
+        // Columns the COPY never mentions stay Null — that is what Postgres does,
+        // and silo will reject it if the column is actually required.
+        let mut row = vec![Value::Null; self.schema.len()];
+        for (&index, field) in targets.iter().zip(fields) {
+            if field != self.null_marker {
+                row[index] = parse_value(field, &self.schema[index])?;
+            }
         }
-        self.rows.push(fields);
+
+        if self.session.is_none() {
+            self.session = Some(sink.lock().await.begin_write(&self.stream).await?);
+        }
+        self.session
+            .as_mut()
+            .expect("session opened just above")
+            .push(row)
+            .await?;
         self.total += 1;
         Ok(())
     }
-
-    /// First data row: infer + fix column types, ensure the table, open a session.
-    async fn setup(&mut self, sink: &Arc<Mutex<IcebergTableSink>>, first_row: &[Option<String>]) -> Result<(), Error> {
-        let fields: Vec<Field> = self
-            .columns
-            .iter()
-            .zip(first_row)
-            .map(|(name, value)| {
-                let data_type = value.as_deref().map(infer_type).unwrap_or(DataType::Utf8);
-                Field::new(name, data_type, true)
-            })
-            .collect();
-        let schema = Arc::new(ArrowSchema::new(fields));
-        let iceberg_schema = to_iceberg_schema(schema.as_ref())?;
-
-        let mut guard = sink.lock().await;
-        guard.setup(&self.stream, &iceberg_schema).await?;
-        let session = guard.begin_write(&self.stream).await?;
-        drop(guard);
-
-        self.schema = Some(schema);
-        self.session = Some(session);
-        Ok(())
-    }
-
-    async fn flush(&mut self) -> Result<(), Error> {
-        if self.rows.is_empty() {
-            return Ok(());
-        }
-        let schema = self.schema.clone().expect("schema is set before any row is buffered");
-        let rows = std::mem::take(&mut self.rows);
-        let batch = build_batch(&schema, &rows)?;
-        self.session
-            .as_mut()
-            .expect("session is opened before any row is buffered")
-            .write(batch)
-            .await
-    }
 }
 
-/// Infers an Arrow type from one wire value: integer, then float, then boolean,
-/// else text. ponytail: order matters and it is a guess — see the module note.
-fn infer_type(value: &str) -> DataType {
-    if value.parse::<i64>().is_ok() {
-        DataType::Int64
-    } else if value.parse::<f64>().is_ok() {
-        DataType::Float64
-    } else if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("false") {
-        DataType::Boolean
-    } else {
-        DataType::Utf8
-    }
-}
-
-fn build_batch(schema: &Arc<ArrowSchema>, rows: &[Vec<Option<String>>]) -> Result<RecordBatch, Error> {
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
-    for (idx, field) in schema.fields().iter().enumerate() {
-        let column: Arc<dyn Array> = match field.data_type() {
-            DataType::Int64 => Arc::new(
-                rows.iter()
-                    .map(|row| row[idx].as_deref().map(parse_i64).transpose())
-                    .collect::<Result<Int64Array, _>>()?,
-            ),
-            DataType::Float64 => Arc::new(
-                rows.iter()
-                    .map(|row| row[idx].as_deref().map(parse_f64).transpose())
-                    .collect::<Result<Float64Array, _>>()?,
-            ),
-            DataType::Boolean => Arc::new(
-                rows.iter()
-                    .map(|row| row[idx].as_deref().map(parse_bool).transpose())
-                    .collect::<Result<BooleanArray, _>>()?,
-            ),
-            _ => Arc::new(rows.iter().map(|row| row[idx].clone()).collect::<StringArray>()),
-        };
-        columns.push(column);
-    }
-    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
-        Error::wrap_invalid_input(e, Code::must_new("copy_batch_build_failed"), "failed to build record batch from COPY rows")
-    })
-}
-
-fn parse_i64(value: &str) -> Result<i64, Error> {
-    value.parse::<i64>().map_err(|e| {
-        Error::wrap_invalid_input(e, Code::must_new("copy_parse_int_failed"), format!("cannot parse '{value}' as integer"))
-    })
-}
-
-fn parse_f64(value: &str) -> Result<f64, Error> {
-    value.parse::<f64>().map_err(|e| {
-        Error::wrap_invalid_input(e, Code::must_new("copy_parse_float_failed"), format!("cannot parse '{value}' as float"))
-    })
-}
-
-fn parse_bool(value: &str) -> Result<bool, Error> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "t" | "1" => Ok(true),
-        "false" | "f" | "0" => Ok(false),
-        _ => Err(Error::new_invalid_input(
-            Code::must_new("copy_parse_bool_failed"),
-            format!("cannot parse '{value}' as boolean"),
-        )),
+/// One wire field -> one `Value`, parsed as the column's *registered* type. No
+/// inference: the type was fixed at `CREATE TABLE`.
+fn parse_value(text: &str, column: &Column) -> Result<Value, Error> {
+    let invalid = |what: &str| {
+        Error::new_invalid_input(
+            CODE_PARSE_FAILED.clone(),
+            format!("column '{}': cannot parse '{text}' as {what}", column.name),
+        )
+    };
+    match column.column_type {
+        ColumnType::Bool => match text.to_ascii_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Bool(true)),
+            "false" | "f" | "no" | "n" | "0" => Ok(Value::Bool(false)),
+            _ => Err(invalid("a boolean")),
+        },
+        ColumnType::Int64 => text.parse::<i64>().map(Value::Int64).map_err(|_| invalid("an integer")),
+        ColumnType::Float64 => text.parse::<f64>().map(Value::Float64).map_err(|_| invalid("a number")),
+        ColumnType::String => Ok(Value::String(text.to_string())),
     }
 }
 
@@ -405,8 +347,17 @@ fn parse_bool(value: &str) -> Result<bool, Error> {
 mod tests {
     use super::*;
 
-    fn plan_of(sql: &str) -> CopyInner {
-        detect(sql).expect("valid copy").expect("recognized as copy").inner.into_inner()
+    fn plan_of(sql: &str) -> CopyPlan {
+        detect(sql).expect("valid copy").expect("recognized as copy")
+    }
+
+    /// id BIGINT, name TEXT, score DOUBLE PRECISION
+    fn schema() -> Vec<Column> {
+        vec![
+            Column::new("id", ColumnType::Int64, false),
+            Column::new("name", ColumnType::String, false),
+            Column::new("score", ColumnType::Float64, false),
+        ]
     }
 
     #[test]
@@ -414,15 +365,15 @@ mod tests {
         let plan = plan_of("COPY demo.events (id, name) FROM STDIN WITH (FORMAT csv)");
         assert_eq!(plan.stream, StreamId::new(["demo"], "events"));
         assert_eq!(plan.columns, vec!["id".to_string(), "name".to_string()]);
-        assert_eq!(plan.delimiter, ',');
-        assert_eq!(plan.null_marker, "");
+        assert_eq!(plan.format.delimiter, ',');
+        assert_eq!(plan.format.null_marker, "");
     }
 
     #[test]
     fn text_format_is_the_default() {
         let plan = plan_of("COPY demo.events (id) FROM STDIN");
-        assert_eq!(plan.delimiter, '\t');
-        assert_eq!(plan.null_marker, "\\N");
+        assert_eq!(plan.format.delimiter, '\t');
+        assert_eq!(plan.format.null_marker, "\\N");
     }
 
     /// psql's `\copy t from 'f' csv header` emits pre-9.0 syntax, which
@@ -431,16 +382,15 @@ mod tests {
     #[test]
     fn legacy_options_are_honoured() {
         let plan = plan_of("COPY demo.events (id, name) FROM STDIN CSV HEADER");
-        assert_eq!(plan.delimiter, ',');
-        assert!(plan.header_pending);
+        assert_eq!(plan.format.delimiter, ',');
+        assert!(plan.format.header);
 
         let plan = plan_of("COPY demo.events (id, name) FROM STDIN DELIMITER '|'");
-        assert_eq!(plan.delimiter, '|');
+        assert_eq!(plan.format.delimiter, '|');
     }
 
     #[test]
     fn options_we_cannot_honour_are_rejected() {
-        // Both spellings of an option whose semantics we do not implement.
         assert!(detect("COPY demo.events (id) FROM STDIN WITH (FORMAT csv, QUOTE '~')").is_err());
         assert!(detect("COPY demo.events (id) FROM STDIN CSV QUOTE '~'").is_err());
         assert!(detect("COPY demo.events (id) FROM STDIN BINARY").is_err());
@@ -459,31 +409,38 @@ mod tests {
         assert!(detect("SELECT 1; SELECT 2").unwrap().is_none());
     }
 
+    /// No column list and no header: the wire fields are the table's columns.
     #[test]
-    fn copy_without_columns_or_header_is_rejected() {
-        assert!(detect("COPY demo.events FROM STDIN").is_err());
+    fn bare_copy_targets_every_column_in_table_order() {
+        let state = CopyState::new(plan_of("COPY demo.events FROM STDIN"), &schema()).unwrap();
+        assert_eq!(state.columns, 3);
     }
 
     #[test]
-    fn build_batch_parses_inferred_types() {
-        let schema = Arc::new(ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, true),
-            Field::new("name", DataType::Utf8, true),
-        ]));
-        let rows = vec![
-            vec![Some("1".to_string()), Some("a".to_string())],
-            vec![Some("2".to_string()), None],
-        ];
-        let batch = build_batch(&schema, &rows).expect("builds");
-        assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 2);
-        assert!(batch.column(1).is_null(1));
+    fn a_column_the_table_does_not_have_is_rejected() {
+        let plan = plan_of("COPY demo.events (id, nope) FROM STDIN");
+        assert!(CopyState::new(plan, &schema()).is_err());
+    }
+
+    /// A subset column list still produces a full-width row; the rest are Null.
+    #[test]
+    fn subset_and_reordered_columns_map_to_the_right_positions() {
+        let plan = plan_of("COPY demo.events (score, id) FROM STDIN");
+        let state = CopyState::new(plan, &schema()).unwrap();
+        let inner = state.inner.into_inner();
+        assert_eq!(inner.schema.len(), 3);
+        assert_eq!(inner.targets.unwrap(), vec![2, 0]); // score is column 2, id is column 0
     }
 
     #[test]
-    fn build_batch_rejects_unparseable_int() {
-        let schema = Arc::new(ArrowSchema::new(vec![Field::new("id", DataType::Int64, true)]));
-        let rows = vec![vec![Some("not-a-number".to_string())]];
-        assert!(build_batch(&schema, &rows).is_err());
+    fn values_parse_as_the_registered_type_not_an_inferred_one() {
+        let text = Column::new("zip", ColumnType::String, false);
+        let long = Column::new("id", ColumnType::Int64, false);
+
+        // The leading-zero bug: inference made this the integer 1234. A registered
+        // TEXT column keeps the string intact.
+        assert_eq!(parse_value("01234", &text).unwrap(), Value::String("01234".into()));
+        assert_eq!(parse_value("42", &long).unwrap(), Value::Int64(42));
+        assert!(parse_value("not-a-number", &long).is_err());
     }
 }

@@ -28,6 +28,7 @@ static CODE_CATALOG_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_ne
 static CODE_INVALID_STREAM_IDENTIFIER: LazyLock<Code> = LazyLock::new(|| Code::must_new("invalid_stream_identifier"));
 static CODE_NAMESPACE_SETUP_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("namespace_setup_failed"));
 static CODE_TABLE_LOAD_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_load_failed"));
+static CODE_TABLE_ALREADY_EXISTS: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_already_exists"));
 static CODE_UNKNOWN_STREAM: LazyLock<Code> = LazyLock::new(|| Code::must_new("unknown_stream"));
 static CODE_TABLE_COMMIT_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("table_commit_failed"));
 static CODE_SCHEMA_EVOLUTION_UNSUPPORTED: LazyLock<Code> =
@@ -94,13 +95,42 @@ impl IcebergBackend {
         Ok(TableIdent::new(ns, stream.table.clone()))
     }
 
-    pub(crate) async fn ensure_table(
+    /// Load an existing table and return its **authoritative** schema — the one
+    /// recorded in the catalog, not one a caller guessed. `None` if the table
+    /// is not registered; silo never creates a table implicitly, so a caller
+    /// that gets `None` must go through [`Self::create_table`] first.
+    ///
+    /// Also caches the `Table` in `self.tables`, which [`Self::begin_write`]
+    /// looks the stream up in.
+    pub(crate) async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error> {
+        let ident = Self::ident(stream)?;
+        let table_load_failed = |e| wrap_iceberg(e, CODE_TABLE_LOAD_FAILED.clone(), "failed to load table");
+
+        // An absent namespace makes `table_exists` error (NamespaceNotFound)
+        // rather than report `false` — but "no namespace" is just one way of
+        // being unregistered, not a failure.
+        if !self.catalog.namespace_exists(ident.namespace()).await.map_err(table_load_failed)?
+            || !self.catalog.table_exists(&ident).await.map_err(table_load_failed)?
+        {
+            return Ok(None);
+        }
+        let table = self.catalog.load_table(&ident).await.map_err(table_load_failed)?;
+        Ok(Some(self.remember(stream, table)))
+    }
+
+    /// Create the table (and its namespace, if absent) with `schema`. Errors
+    /// with an `AlreadyExists` type if it is already registered — creation is
+    /// explicit and non-idempotent, so `CREATE TABLE` can report a duplicate
+    /// rather than silently adopting whatever schema is already there.
+    pub(crate) async fn create_table(
         &mut self,
         stream: &StreamId,
         schema: &IcebergSchema,
     ) -> Result<IcebergSchema, Error> {
         let ident = Self::ident(stream)?;
 
+        // Namespace first: `table_exists` against a namespace that does not
+        // exist yet errors (NamespaceNotFound) rather than reporting `false`.
         let namespace_setup_failed =
             |e| wrap_iceberg(e, CODE_NAMESPACE_SETUP_FAILED.clone(), "failed to ensure namespace exists");
         if !self.catalog.namespace_exists(ident.namespace()).await.map_err(namespace_setup_failed)? {
@@ -110,24 +140,33 @@ impl IcebergBackend {
                 .map_err(namespace_setup_failed)?;
         }
 
-        let table_load_failed =
-            |e| wrap_iceberg(e, CODE_TABLE_LOAD_FAILED.clone(), "failed to load or create table");
-        let table = if self.catalog.table_exists(&ident).await.map_err(table_load_failed)? {
-            self.catalog.load_table(&ident).await.map_err(table_load_failed)?
-        } else {
-            let creation = TableCreation::builder()
-                .name(ident.name().to_string())
-                .schema(schema.clone())
-                .build();
-            self.catalog
-                .create_table(ident.namespace(), creation)
-                .await
-                .map_err(table_load_failed)?
-        };
+        let table_load_failed = |e| wrap_iceberg(e, CODE_TABLE_LOAD_FAILED.clone(), "failed to create table");
+        if self.catalog.table_exists(&ident).await.map_err(table_load_failed)? {
+            return Err(Error::new_already_exists(
+                CODE_TABLE_ALREADY_EXISTS.clone(),
+                format!("table {stream} already exists"),
+            ));
+        }
 
+        let creation = TableCreation::builder()
+            .name(ident.name().to_string())
+            .schema(schema.clone())
+            .build();
+        let table = self
+            .catalog
+            .create_table(ident.namespace(), creation)
+            .await
+            .map_err(table_load_failed)?;
+
+        Ok(self.remember(stream, table))
+    }
+
+    /// Cache the loaded `Table` and hand back the schema the catalog actually
+    /// holds for it.
+    fn remember(&mut self, stream: &StreamId, table: Table) -> IcebergSchema {
         let current_schema = table.metadata().current_schema().as_ref().clone();
         self.tables.insert(stream.clone(), Arc::new(Mutex::new(table)));
-        Ok(current_schema)
+        current_schema
     }
 
     pub(crate) async fn begin_write(&mut self, stream: &StreamId) -> Result<IcebergWriteSession, Error> {

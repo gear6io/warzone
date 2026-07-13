@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use arrow_cast::display::array_value_to_string;
 use axum::{
     extract::{Json, State},
@@ -11,6 +13,8 @@ use errors::{Code, Error};
 use crate::querier::QueryResult;
 
 use crate::silo::AppState;
+
+static CODE_RESULT_ENCODE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("query_result_encode_failed"));
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
@@ -34,7 +38,7 @@ fn to_json(result: QueryResult) -> Result<QueryResponseJson, Error> {
                     row.push(Value::Null);
                 } else {
                     let text = array_value_to_string(column.as_ref(), row_idx).map_err(|e| {
-                        Error::wrap_internal(e, Code::must_new("query_result_encode_failed"), "failed to encode query result value")
+                        Error::wrap_internal(e, CODE_RESULT_ENCODE_FAILED.clone(), "failed to encode query result value")
                     })?;
                     row.push(Value::String(text));
                 }

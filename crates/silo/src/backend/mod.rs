@@ -18,8 +18,13 @@ use crate::StreamId;
 pub trait DestinationWriter: Send + Sync {
     fn name(&self) -> &str;
 
-    /// Load or create the table for `stream`, returning its current schema.
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error>;
+    /// Load an already-registered table, returning the schema the catalog
+    /// actually holds. `None` if it is not registered — silo never creates a
+    /// table implicitly.
+    async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error>;
+
+    /// Create the table with `schema`. Errors (`AlreadyExists`) if it exists.
+    async fn create_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error>;
 
     /// Begin a streaming write session for `stream`: records fed to the
     /// returned [`WriteSession`] land in one open Parquet file until either
