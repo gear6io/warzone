@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>warzone · play</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --border: #2b3038;
+    --text: #d7dbe0;
+    --muted: #7d8590;
+    --accent: #f2c14e;
+    --error: #f47174;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    height: 100vh;
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 var(--mono);
+  }
+
+  aside {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    overflow-y: auto;
+    padding: 16px;
+  }
+  aside h1 { font-size: 14px; margin: 0 0 20px; letter-spacing: .08em; }
+  aside h1 b { color: var(--accent); }
+  aside h2 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+    margin: 24px 0 8px;
+    font-weight: 500;
+  }
+  .item {
+    padding: 4px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .item:hover { background: #262a32; }
+  .hint {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .hint code {
+    display: block;
+    margin-top: 8px;
+    padding: 6px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .hint code:hover { border-color: var(--accent); }
+
+  main { display: flex; flex-direction: column; overflow: hidden; }
+  #sql {
+    width: 100%;
+    height: 30vh;
+    min-height: 100px;
+    resize: vertical;
+    padding: 16px;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 var(--mono);
+    outline: none;
+    tab-size: 2;
+  }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  button {
+    padding: 5px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--accent);
+    color: #14161a;
+    font: 600 13px var(--mono);
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { color: var(--muted); font-size: 12px; }
+
+  #out { flex: 1; overflow: auto; }
+  table { border-collapse: collapse; width: max-content; min-width: 100%; font-size: 13px; }
+  th, td {
+    padding: 5px 12px;
+    border-right: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    white-space: pre;
+    max-width: 480px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  th {
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  td.null { color: var(--muted); font-style: italic; }
+
+  .err {
+    margin: 16px;
+    padding: 14px 16px;
+    border: 1px solid var(--error);
+    border-left-width: 3px;
+    border-radius: 4px;
+    background: #2a1c1e;
+  }
+  .err .code { color: var(--error); font-weight: 600; margin-bottom: 6px; }
+  .err .msg { white-space: pre-wrap; }
+  .err ul { margin: 10px 0 0; padding-left: 20px; color: var(--muted); }
+</style>
+</head>
+<body>
+<aside>
+  <h1><b>warzone</b> · play</h1>
+  <h2>Tables</h2>
+  <div id="tables"></div>
+  <h2>History</h2>
+  <div id="history"></div>
+</aside>
+
+<main>
+  <textarea id="sql" spellcheck="false" placeholder="SELECT 1"></textarea>
+  <div class="bar">
+    <button id="run">Run ⌘↵</button>
+    <span id="status"></span>
+  </div>
+  <div id="out"></div>
+</main>
+
+<script>
+const MAX_ROWS = 1000;
+const HISTORY_KEY = 'warzone.history';
+
+const $sql = document.getElementById('sql');
+const $run = document.getElementById('run');
+const $status = document.getElementById('status');
+const $out = document.getElementById('out');
+const $tables = document.getElementById('tables');
+const $history = document.getElementById('history');
+
+/** POST /api/v1/query. Relative URL on purpose: the page is served same-origin by the
+ *  server it queries, which is what lets us skip CORS entirely. */
+async function query(sql) {
+  const started = performance.now();
+  const res = await fetch('/api/v1/query', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ sql }),
+  });
+  const ms = Math.round(performance.now() - started);
+  const raw = await res.text();
+  // Axum's own body rejections come back as text/plain, not the errors::Json shape.
+  let body = null;
+  try { body = JSON.parse(raw); } catch { /* leave null, render raw */ }
+  if (!res.ok) throw { status: res.status, body, raw };
+  return { ...body, ms };
+}
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function renderRows({ columns, rows, ms }) {
+  const table = el('table');
+  const head = table.createTHead().insertRow();
+  for (const name of columns) head.appendChild(el('th', null, name));
+
+  const body = table.createTBody();
+  for (const row of rows.slice(0, MAX_ROWS)) {
+    const tr = body.insertRow();
+    for (const cell of row) {
+      // Every non-null cell is already a string server-side; NULL stays visually
+      // distinct from the empty string.
+      const td = tr.insertCell();
+      if (cell === null) { td.className = 'null'; td.textContent = 'NULL'; }
+      else td.textContent = cell;
+    }
+  }
+
+  $out.replaceChildren(table);
+  const truncated = rows.length > MAX_ROWS ? ` · showing first ${MAX_ROWS}` : '';
+  $status.textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} · ${ms} ms${truncated}`;
+}
+
+function renderError(err) {
+  const { status, body, raw } = err;
+  const box = el('div', 'err');
+  box.appendChild(el('div', 'code', body?.code ?? `HTTP ${status}`));
+  box.appendChild(el('div', 'msg', body?.message ?? raw));
+
+  for (const extra of body?.errors ?? []) box.appendChild(el('div', 'msg', extra.message));
+
+  const tips = [...(body?.suggestions ?? []), ...(body?.errors ?? []).flatMap(e => e.suggestions ?? [])];
+  if (tips.length) {
+    const list = el('ul');
+    for (const tip of tips) list.appendChild(el('li', null, tip));
+    box.appendChild(list);
+  }
+
+  $out.replaceChildren(box);
+  $status.textContent = 'failed';
+}
+
+async function submit() {
+  const sql = $sql.value.trim();
+  if (!sql) return;
+
+  // Queries serialize on a single DuckDB connection server-side; don't let the user
+  // stack them up and desync the timer.
+  $run.disabled = true;
+  $status.textContent = 'running…';
+  try {
+    renderRows(await query(sql));
+    remember(sql);
+  } catch (err) {
+    renderError(err);
+  } finally {
+    $run.disabled = false;
+  }
+}
+
+function setSql(sql) {
+  $sql.value = sql;
+  $sql.focus();
+}
+
+// --- history -----------------------------------------------------------------
+
+function readHistory() {
+  try { return JSON.parse(localStorage.getItem(HISTORY_KEY)) ?? []; } catch { return []; }
+}
+
+function remember(sql) {
+  const history = readHistory().filter(entry => entry.sql !== sql);
+  history.unshift({ sql, ts: Date.now() });
+  try { localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, 50))); } catch { /* full or blocked */ }
+  renderHistory();
+}
+
+function renderHistory() {
+  const history = readHistory();
+  $history.replaceChildren(...history.map(({ sql }) => {
+    const item = el('div', 'item', sql.replace(/\s+/g, ' '));
+    item.title = sql;
+    item.onclick = () => setSql(sql);
+    return item;
+  }));
+  if (!history.length) $history.replaceChildren(el('div', 'hint', 'Nothing yet.'));
+}
+
+// --- table sidebar -----------------------------------------------------------
+
+/** Tier 1 runs a memory catalog that DuckDB never ATTACHes, so it has no tables to
+ *  list at all — data is read straight off parquet. Zero rows and a hard failure are
+ *  the same situation from here, so they get the same hint. */
+function noTables() {
+  const hint = el('div', 'hint', 'No catalog tables. On the local (memory-catalog) config, read parquet directly:');
+  const snippet = el('code', null, "SELECT *\nFROM read_parquet('dev/data/warehouse/<ns>/<table>/data/*.parquet')\nLIMIT 100");
+  snippet.onclick = () => setSql(snippet.textContent);
+  hint.appendChild(snippet);
+  $tables.replaceChildren(hint);
+}
+
+async function loadTables() {
+  let result;
+  try {
+    result = await query('SHOW ALL TABLES');
+  } catch {
+    return noTables();
+  }
+  if (!result.rows.length) return noTables();
+
+  // Index by column name — SHOW ALL TABLES' column order is DuckDB's business.
+  const db = result.columns.indexOf('database');
+  const schema = result.columns.indexOf('schema');
+  const name = result.columns.indexOf('name');
+
+  $tables.replaceChildren(...result.rows.map(row => {
+    const qualified = [row[db], row[schema], row[name]].filter(Boolean).join('.');
+    const item = el('div', 'item', `${row[schema]}.${row[name]}`);
+    item.title = qualified;
+    // Always LIMIT: the server materializes the whole result set, so an unbounded
+    // SELECT * is a server-side OOM, not just a slow page.
+    item.onclick = () => setSql(`SELECT * FROM ${qualified} LIMIT 100`);
+    return item;
+  }));
+}
+
+// --- boot --------------------------------------------------------------------
+
+$run.onclick = submit;
+$sql.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); submit(); }
+});
+
+setSql('SELECT 1 AS id, NULL AS note');
+renderHistory();
+loadTables();
+</script>
+</body>
+</html>
