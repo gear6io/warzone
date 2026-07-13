@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use errors::{Code, Error};
 use silo::backend::filesystem::FilesystemDestinationWriter;
@@ -8,6 +8,9 @@ use silo::config::{DestinationConfig, SinkConfig, StorageConfig};
 use silo::destination::{Destination, MultiDestination, SingleDestination};
 use silo::ingest::IcebergTableSink;
 use tokio::sync::Mutex;
+
+static CODE_INVALID_DESTINATION_STORAGE: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("invalid_destination_storage"));
 
 #[derive(Clone)]
 pub struct AppState {
@@ -26,7 +29,7 @@ async fn build_writer(config: &DestinationConfig) -> Result<Box<dyn DestinationW
             Ok(Box::new(writer))
         }
         StorageConfig::Memory | StorageConfig::Minio { .. } => Err(Error::new_invalid_input(
-            Code::must_new("invalid_destination_storage"),
+            CODE_INVALID_DESTINATION_STORAGE.clone(),
             format!("destination '{}': storage backend is not valid for a running server", config.name),
         )),
     }
@@ -44,5 +47,5 @@ pub async fn build_sink(config: &SinkConfig) -> Result<IcebergTableSink, Error> 
         Box::new(MultiDestination::new(writers))
     };
 
-    Ok(IcebergTableSink::new(destination))
+    Ok(IcebergTableSink::new(destination, config.batch_size))
 }

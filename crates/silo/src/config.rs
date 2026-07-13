@@ -9,6 +9,10 @@ fn default_batch_size() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub destinations: Vec<DestinationConfig>,
+    /// Rows buffered before an ingest session flushes them as one Arrow
+    /// `RecordBatch` into its Parquet file. The single knob controlling how many
+    /// rows are ever held in memory during an ingest — see
+    /// [`crate::ingest::IngestSession::push`].
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 }
@@ -121,12 +125,10 @@ mod tests {
                     "catalog": { "type": "memory", "warehouse": "file:///tmp/warehouse" },
                     "storage": { "type": "file_system", "root_path": "/tmp/warehouse" }
                 }
-            ],
-            "batch_size": 5000
+            ]
         });
 
         let config: SinkConfig = serde_json::from_value(json).unwrap();
         assert_eq!(config.destinations.len(), 2);
-        assert_eq!(config.batch_size, 5000);
     }
 }

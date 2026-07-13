@@ -31,5 +31,8 @@ dev-down: ## Tier 2: stop the stack and delete its volumes
 run-stack: ## Tier 2: run against the REST-catalog/S3 stack (needs dev-up first)
 	cargo run -- --config dev/stack.yaml
 
-clean-data: ## Remove Tier 1 local data (dev/data/)
+clean: ## Remove Tier 1 local data (dev/data/)
 	rm -rf dev/data/
+
+load-dummy:
+	go run dev/scripts/ingestion/main.go

@@ -23,3 +23,4 @@ pgwire = "0.40"
 async-trait = "0.1.89"
 futures = "0.3"
 duckdb = { version = "1.10504", features = ["bundled"] }
+sqlparser = { version = "0.62", features = ["visitor"] }

@@ -45,8 +45,12 @@ impl DestinationWriter for FilesystemDestinationWriter {
         self.inner.name()
     }
 
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
-        self.inner.ensure_table(stream, schema).await
+    async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error> {
+        self.inner.load_table(stream).await
+    }
+
+    async fn create_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error> {
+        self.inner.create_table(stream, schema).await
     }
 
     async fn begin_write(&mut self, stream: &StreamId) -> Result<Box<dyn WriteSession>, Error> {

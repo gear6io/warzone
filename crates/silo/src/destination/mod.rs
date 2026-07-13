@@ -17,7 +17,12 @@ use crate::StreamId;
 /// Callers (Layer 1, [`crate::ingest::TableSink`]) don't need to know which.
 #[async_trait]
 pub trait Destination: Send + Sync {
-    async fn ensure_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<(), Error>;
+    /// Load an already-registered table's authoritative schema. `None` if it is
+    /// not registered anywhere.
+    async fn load_table(&mut self, stream: &StreamId) -> Result<Option<IcebergSchema>, Error>;
+
+    /// Create the table with `schema` in every backend.
+    async fn create_table(&mut self, stream: &StreamId, schema: &IcebergSchema) -> Result<IcebergSchema, Error>;
 
     /// Begin a streaming write session, fanned out to every underlying
     /// backend. The returned [`DestinationSession`] is itself a fan-out:

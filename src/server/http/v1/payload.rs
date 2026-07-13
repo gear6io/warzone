@@ -1,28 +1,30 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::LazyLock;
 
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use axum::{
     extract::{Json, State},
     http::StatusCode,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 
 use errors::{Code, Error};
-use silo::ingest::schema::to_iceberg_schema;
-use silo::ingest::TableSink;
+use silo::ingest::{Column, ColumnType, TableSink, Value};
 use silo::StreamId;
 
 use crate::silo::AppState;
+
+static CODE_UNKNOWN_COLUMN: LazyLock<Code> = LazyLock::new(|| Code::must_new("insert_unknown_column"));
+static CODE_VALUE_TYPE_MISMATCH: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("insert_value_type_mismatch"));
+static CODE_UNKNOWN_TABLE: LazyLock<Code> = LazyLock::new(|| Code::must_new("insert_unknown_table"));
 
 #[derive(Deserialize)]
 pub struct InsertIntoRequest {
     namespace: String,
     table: String,
-    data: HashMap<String, Value>,
+    data: HashMap<String, JsonValue>,
 }
 
 #[derive(Serialize)]
@@ -30,52 +32,66 @@ pub struct Reponse {
     pub success: bool,
 }
 
-fn json_to_record_batch(data: &HashMap<String, Value>) -> Result<RecordBatch, Error> {
-    let mut fields = Vec::with_capacity(data.len());
-    let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(data.len());
-
-    for (name, value) in data {
-        let (data_type, column): (DataType, Arc<dyn Array>) = match value {
-            Value::String(s) => (DataType::Utf8, Arc::new(StringArray::from(vec![s.clone()]))),
-            Value::Number(n) if n.is_i64() || n.is_u64() => (
-                DataType::Int64,
-                Arc::new(Int64Array::from(vec![n.as_i64().unwrap()])),
-            ),
-            Value::Number(n) => (
-                DataType::Float64,
-                Arc::new(Float64Array::from(vec![n.as_f64().unwrap()])),
-            ),
-            Value::Bool(b) => (DataType::Boolean, Arc::new(BooleanArray::from(vec![*b]))),
-            Value::Null | Value::Array(_) | Value::Object(_) => {
-                return Err(Error::new_invalid_input(
-                    Code::must_new("unsupported_field_value"),
-                    format!("field '{name}': null/array/object values are not supported"),
-                ));
-            }
-        };
-        fields.push(Field::new(name, data_type, false));
-        columns.push(column);
+/// Coerce a JSON object into a row shaped like the table's *registered* schema:
+/// values land in column order, and each one is parsed as the type `CREATE TABLE`
+/// declared — not as whatever the JSON happened to look like. Absent keys are
+/// `Null`; silo rejects that if the column is required.
+///
+/// A key the table does not have is an error rather than a silent drop: a typo'd
+/// field name that quietly vanishes is worse than a rejected insert.
+fn to_row(schema: &[Column], data: &HashMap<String, JsonValue>) -> Result<Vec<Value>, Error> {
+    if let Some(unknown) = data.keys().find(|key| !schema.iter().any(|c| &&c.name == key)) {
+        return Err(Error::new_invalid_input(
+            CODE_UNKNOWN_COLUMN.clone(),
+            format!("column '{unknown}' does not exist on this table"),
+        ));
     }
 
-    let schema = Arc::new(ArrowSchema::new(fields));
-    RecordBatch::try_new(schema, columns).map_err(|e| {
-        Error::wrap_invalid_input(
-            e,
-            Code::must_new("record_batch_build_failed"),
-            "failed to build record batch from payload",
-        )
-    })
+    schema
+        .iter()
+        .map(|column| match data.get(&column.name) {
+            None | Some(JsonValue::Null) => Ok(Value::Null),
+            Some(value) => to_value(value, column),
+        })
+        .collect()
 }
 
+fn to_value(json: &JsonValue, column: &Column) -> Result<Value, Error> {
+    let mismatch = || {
+        Error::new_invalid_input(
+            CODE_VALUE_TYPE_MISMATCH.clone(),
+            format!("column '{}': cannot store {json} in a {:?} column", column.name, column.column_type),
+        )
+    };
+
+    match (column.column_type, json) {
+        (ColumnType::Bool, JsonValue::Bool(b)) => Ok(Value::Bool(*b)),
+        (ColumnType::Int64, JsonValue::Number(n)) => n.as_i64().map(Value::Int64).ok_or_else(mismatch),
+        (ColumnType::Float64, JsonValue::Number(n)) => n.as_f64().map(Value::Float64).ok_or_else(mismatch),
+        (ColumnType::String, JsonValue::String(s)) => Ok(Value::String(s.clone())),
+        _ => Err(mismatch()),
+    }
+}
+
+/// ponytail: one request = one session = one Parquet file + one Iceberg snapshot.
+/// Fine for the occasional insert, pathological as a bulk path — that is what
+/// `COPY` is for. The upgrade, if this ever needs to take sustained traffic, is a
+/// silo-owned per-stream buffer that flushes on size/time (ClickHouse's
+/// `async_insert` shape), not a bigger batch here.
 async fn ingest(state: &AppState, payload: &InsertIntoRequest) -> Result<(), Error> {
-    let batch = json_to_record_batch(&payload.data)?;
     let stream = StreamId::new([payload.namespace.clone()], payload.table.clone());
-    let iceberg_schema = to_iceberg_schema(batch.schema().as_ref())?;
 
     let mut sink = state.sink.lock().await;
-    sink.setup(&stream, &iceberg_schema).await?;
+    let schema = sink.schema(&stream).await?.ok_or_else(|| {
+        Error::new_not_found(
+            CODE_UNKNOWN_TABLE.clone(),
+            format!("table {stream} does not exist — create it first"),
+        )
+    })?;
+    let row = to_row(&schema, &payload.data)?;
+
     let mut session = sink.begin_write(&stream).await?;
-    session.write(batch).await?;
+    session.push(row).await?;
     session.commit().await?;
     Ok(())
 }
@@ -91,5 +107,43 @@ pub async fn accept_payload(
             Json(e.as_json()),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// id BIGINT, name TEXT
+    fn schema() -> Vec<Column> {
+        vec![Column::new("id", ColumnType::Int64, false), Column::new("name", ColumnType::String, false)]
+    }
+
+    fn data(pairs: &[(&str, JsonValue)]) -> HashMap<String, JsonValue> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    }
+
+    #[test]
+    fn values_land_in_registered_column_order() {
+        // Deliberately reversed relative to the schema — the row must not be.
+        let row = to_row(&schema(), &data(&[("name", "a".into()), ("id", 1.into())])).unwrap();
+        assert_eq!(row, vec![Value::Int64(1), Value::String("a".into())]);
+    }
+
+    #[test]
+    fn a_missing_column_is_null_not_an_error() {
+        let row = to_row(&schema(), &data(&[("id", 1.into())])).unwrap();
+        assert_eq!(row, vec![Value::Int64(1), Value::Null]);
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_type_is_rejected() {
+        // Under the old code this silently retyped the column to Utf8.
+        assert!(to_row(&schema(), &data(&[("id", "not-a-number".into())])).is_err());
+    }
+
+    #[test]
+    fn an_unknown_column_is_rejected_not_dropped() {
+        assert!(to_row(&schema(), &data(&[("nope", 1.into())])).is_err());
     }
 }
