@@ -61,7 +61,8 @@ pub struct RetryJson {
     pub delay_ms: u128,
 }
 
-/// Converts an [`Error`] to its JSON response representation.
+/// Converts an [`Error`] to JSON. The `source` chain is emitted under
+/// `errors` alongside `additional`.
 pub fn as_json(err: &Error) -> Json {
     Json {
         kind: err.kind().to_string(),
@@ -75,6 +76,10 @@ pub fn as_json(err: &Error) -> Json {
                 message: a.message.clone(),
                 suggestions: a.suggestions.clone(),
             })
+            .chain(err.causes().into_iter().map(|message| ErrorAdditional {
+                message,
+                suggestions: Vec::new(),
+            }))
             .collect(),
         retry: err
             .retry
@@ -117,6 +122,24 @@ mod tests {
         assert_eq!(err.retry_delay(), Duration::from_secs(5));
         let j = as_json(&err);
         assert_eq!(j.retry.unwrap().delay_ms, 5000);
+    }
+
+    #[test]
+    fn wrapped_cause_reaches_json() {
+        let duckdb_like = std::io::Error::other("Catalog Error: Table with name trips does not exist");
+        let err = Error::wrap_invalid_input(duckdb_like, Code::INVALID_INPUT, "invalid query: select * from demo.trips");
+        let j = as_json(&err);
+        assert_eq!(j.message, "invalid query: select * from demo.trips");
+        assert!(j.errors.iter().any(|e| e.message.contains("Catalog Error")));
+    }
+
+    #[test]
+    fn nested_causes_are_not_duplicated() {
+        let root = std::io::Error::other("root cause");
+        let inner = Error::wrap_internal(root, Code::INTERNAL, "inner boundary");
+        let outer = Error::wrap_invalid_input(inner, Code::INVALID_INPUT, "outer boundary");
+        let messages: Vec<_> = as_json(&outer).errors.into_iter().map(|e| e.message).collect();
+        assert_eq!(messages, vec!["inner boundary", "root cause"]);
     }
 
     #[test]

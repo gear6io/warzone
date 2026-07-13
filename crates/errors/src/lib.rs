@@ -232,6 +232,22 @@ impl Error {
         &self.suggestions
     }
 
+    /// The messages of every error in the `source` chain, outermost cause
+    /// first. Without this the underlying cause a `wrap_*` captured is
+    /// invisible to callers rendering an error (HTTP JSON, pgwire), which
+    /// leaves only the boundary message.
+    pub fn causes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut next = std::error::Error::source(self);
+        while let Some(err) = next {
+            // An `Error`'s Display delegates to its own source, so reading it
+            // here would repeat the innermost message at every level.
+            out.push(err.downcast_ref::<Error>().map_or_else(|| err.to_string(), |e| e.message.clone()));
+            next = err.source();
+        }
+        out
+    }
+
     /// Explicit retry delay, or `Duration::ZERO` when none was set.
     pub fn retry_delay(&self) -> Duration {
         self.retry.unwrap_or(Duration::ZERO)

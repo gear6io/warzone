@@ -8,9 +8,12 @@ use pgwire::error::{ErrorInfo, PgWireError};
 const SEVERITY_ERROR: &str = "ERROR";
 
 pub fn to_pgwire_error(err: &Error) -> PgWireError {
-    PgWireError::UserError(Box::new(ErrorInfo::new(
+    let mut info = ErrorInfo::new(
         SEVERITY_ERROR.to_string(),
         sqlstate(err.kind()).to_string(),
         err.message().to_string(),
-    )))
+    );
+    let causes = err.causes();
+    info.detail = (!causes.is_empty()).then(|| causes.join(": "));
+    PgWireError::UserError(Box::new(info))
 }
