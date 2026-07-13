@@ -72,7 +72,7 @@ func run() error {
 	ddl := fmt.Sprintf("CREATE TABLE %s (%s)", table, strings.Join(defs, ", "))
 	if _, err := conn.Exec(ctx, ddl).ReadAll(); err != nil {
 		if strings.Contains(err.Error(), "already exists") {
-			return fmt.Errorf("%s is already loaded — to reload: `make clean-data`, restart warzone, rerun", table)
+			return fmt.Errorf("%s is already loaded — to reload: `make clean`, restart warzone, rerun", table)
 		}
 		return fmt.Errorf("%s: %w", ddl, err)
 	}

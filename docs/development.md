@@ -32,7 +32,8 @@ first query after a fresh start is slower and needs internet access.
 | `make dev-up` | Tier 2: start Polaris + SeaweedFS, create bucket + catalog |
 | `make dev-down` | Tier 2: stop the stack and delete its volumes |
 | `make run-stack` | Tier 2: `cargo run -- --config dev/stack.yaml` |
-| `make clean-data` | Remove Tier 1 data under `dev/data/` |
+| `make clean` | Remove Tier 1 data under `dev/data/` |
+| `make load-dummy` | Load the dummy NYC-taxi dataset into `demo.trips` (needs a running server) |
 
 ## Ports
 
@@ -71,7 +72,7 @@ psql -h 127.0.0.1 -p 5432 -c \
 ```
 
 Files land under `dev/data/warehouse/<namespace>/<table>/` as Iceberg
-metadata + Parquet data. Wipe it with `make clean-data`.
+metadata + Parquet data. Wipe it with `make clean`.
 
 **Caveat — no catalog by name.** Tier 1 uses `CatalogConfig::Memory`, which
 holds table metadata in-process only. The querier does not attach memory
@@ -126,6 +127,24 @@ reset on the next `dev-up`):
 ```sh
 make dev-down
 ```
+
+## Playground and sample data
+
+The HTTP server serves a browser SQL playground at
+[localhost:3886/play](http://localhost:3886/play)
+([ui/play.html](../ui/play.html), embedded at compile time). It lists tables,
+keeps query history, and renders results.
+
+With a server already running (either tier), load the dummy NYC-taxi dataset:
+
+```sh
+make load-dummy
+```
+
+[dev/scripts/ingestion](../dev/scripts/ingestion) reads the Parquet under
+`dev/demo/`, derives the schema, and `CREATE TABLE` + `COPY ... FROM STDIN`s it
+into `demo.trips` over the Postgres wire protocol. It refuses to run twice — to
+reload, `make clean`, restart warzone, and rerun.
 
 ## Configuration reference
 

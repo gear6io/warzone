@@ -35,15 +35,32 @@ psql -h 127.0.0.1 -p 5432 -c \
 
 Data lands under `dev/data/warehouse/` as real Iceberg tables + Parquet.
 Tier 1 uses an in-memory catalog, so tables aren't registered by name —
-read them via `read_parquet(...)`. For catalog-qualified SQL
-(`warehouse.demo.events`) against a real REST catalog + S3, use the Tier 2
-stack. Full guide and config reference: [docs/development.md](docs/development.md).
+read them via `read_parquet(...)`.
+
+For catalog-qualified SQL (`SELECT * FROM warzone.demo.events`) against a real
+REST catalog + S3, use the Tier 2 stack — Apache Polaris + SeaweedFS in Docker:
+
+```sh
+make dev-up      # start Polaris + SeaweedFS, create the bucket and catalog
+make run-stack   # run warzone against dev/stack.yaml
+make dev-down    # stop the stack and delete its volumes
+```
+
+Full guide and config reference: [docs/development.md](docs/development.md).
 
 ## Playground
 
 The server ships a browser SQL playground at
 [localhost:3886/play](http://localhost:3886/play) — table list, query history,
-and results grid. `make load-dummy` seeds a `demo.trips` table to try it against.
+and results grid.
+
+To try it against real data, leave the server running and, in another terminal,
+load the dummy NYC-taxi dataset into `demo.trips` over the Postgres wire
+protocol:
+
+```sh
+make load-dummy
+```
 
 ![warzone play — browser SQL playground](ui/images/readme.png)
 
