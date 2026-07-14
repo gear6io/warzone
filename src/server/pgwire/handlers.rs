@@ -13,19 +13,26 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::PgWireBackendMessage;
+use tokio::sync::Mutex;
 
 use errors::{Code, Error};
-use silo::ingest::TableSink;
 
 use super::error::to_pgwire_error;
 use super::results::record_batches_to_query_response;
-use super::{copy, ddl};
+use crate::querier::intercepter::{CopyInFlight, Intercepter, Outcome};
 use crate::silo::AppState;
 
-static CODE_COPY_UNKNOWN_TABLE: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_unknown_table"));
+static CODE_RESULT_ENCODE_FAILED: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("query_result_encode_failed"));
+
+/// The connection's COPY slot. `SessionExtensions` has no `remove`, so a finished COPY
+/// is cleared by leaving `None` behind rather than by dropping the entry.
+type CopySlot = Mutex<Option<CopyInFlight>>;
 
 pub struct Handler {
-    state: AppState,
+    /// One for the whole server: the Intercepter is stateless, so there is nothing to
+    /// keep per connection.
+    intercepter: Intercepter,
 }
 
 fn no_copy_in_progress() -> PgWireError {
@@ -36,72 +43,60 @@ fn no_copy_in_progress() -> PgWireError {
     )))
 }
 
+impl Handler {
+    fn copy_slot<C: ClientInfo>(&self, client: &C) -> PgWireResult<Arc<CopySlot>> {
+        client
+            .session_extensions()
+            .get::<CopySlot>()
+            .ok_or_else(no_copy_in_progress)
+    }
+}
+
 #[async_trait]
 impl NoopStartupHandler for Handler {}
 
 #[async_trait]
 impl SimpleQueryHandler for Handler {
+    /// Renders what the [`Intercepter`] did onto the Postgres wire, taking custody of a
+    /// COPY when one starts — the Intercepter is stateless, so the connection is the
+    /// only thing with the right lifetime.
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        // `CREATE TABLE` registers a schema with silo; `COPY ... FROM STDIN`
-        // ingests against an already-registered one. Everything else (reads,
-        // other DDL, ...) goes to the querier unchanged.
-        if let Some(plan) = ddl::detect(query).map_err(|e| to_pgwire_error(&e))? {
-            return self.create_table(plan).await;
-        }
-        if let Some(plan) = copy::detect(query).map_err(|e| to_pgwire_error(&e))? {
-            return self.begin_copy(client, plan).await;
-        }
-
-        let result = self.state.querier.query(query).await.map_err(|e| to_pgwire_error(&e))?;
-        Ok(vec![Response::Query(record_batches_to_query_response(result)?)])
-    }
-}
-
-impl Handler {
-    async fn create_table(&self, plan: ddl::CreateTablePlan) -> PgWireResult<Vec<Response>> {
-        let mut sink = self.state.sink.lock().await;
-        let already_registered = sink
-            .schema(&plan.stream)
+        match self
+            .intercepter
+            .visit(query)
             .await
             .map_err(|e| to_pgwire_error(&e))?
-            .is_some();
+        {
+            Outcome::Created => Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]),
 
-        // `register` errors on a duplicate by itself; the lookup above only
-        // exists so `IF NOT EXISTS` can turn that into a no-op.
-        if !(plan.if_not_exists && already_registered) {
-            sink.register(&plan.stream, &plan.columns)
-                .await
-                .map_err(|e| to_pgwire_error(&e))?;
+            // Encoding only fails when Arrow cannot render a value, which is ours, not
+            // the caller's — hence Internal rather than an opaque protocol error.
+            Outcome::Rows(result) => record_batches_to_query_response(result)
+                .map(|response| vec![Response::Query(response)])
+                .map_err(|e| {
+                    to_pgwire_error(&Error::wrap_internal(
+                        e,
+                        CODE_RESULT_ENCODE_FAILED.clone(),
+                        "failed to encode query result",
+                    ))
+                }),
+
+            Outcome::CopyIn(copy) => {
+                let columns = copy.width();
+                client
+                    .session_extensions()
+                    .insert::<CopySlot>(Mutex::new(Some(copy)));
+                Ok(vec![Response::CopyIn(CopyResponse::new(
+                    0,
+                    columns,
+                    stream::empty::<PgWireResult<CopyData>>(),
+                ))])
+            }
         }
-        Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
-    }
-
-    /// Resolve the COPY against the table's registered schema, then enter COPY-IN
-    /// mode. An unregistered table is an error here — ingest never creates one.
-    async fn begin_copy<C>(&self, client: &mut C, plan: copy::CopyPlan) -> PgWireResult<Vec<Response>>
-    where
-        C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
-        C::PortalStore: PortalStore,
-    {
-        let schema = {
-            let mut sink = self.state.sink.lock().await;
-            sink.schema(&plan.stream).await.map_err(|e| to_pgwire_error(&e))?
-        };
-        let schema = schema.ok_or_else(|| {
-            to_pgwire_error(&Error::new_not_found(
-                CODE_COPY_UNKNOWN_TABLE.clone(),
-                format!("table {} does not exist — CREATE TABLE it first", plan.stream),
-            ))
-        })?;
-
-        let state = copy::CopyState::new(plan, &schema).map_err(|e| to_pgwire_error(&e))?;
-        let columns = state.columns;
-        client.session_extensions().insert(state);
-        Ok(vec![Response::CopyIn(CopyResponse::new(0, columns, stream::empty::<PgWireResult<CopyData>>()))])
     }
 }
 
@@ -113,13 +108,19 @@ impl CopyHandler for Handler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let state = client.session_extensions().get::<copy::CopyState>().ok_or_else(no_copy_in_progress)?;
-        let mut inner = state.inner.lock().await;
-        if let Err(e) = inner.on_data(&self.state.sink, copy_data.data.as_ref()).await {
-            inner.abort().await;
-            return Err(to_pgwire_error(&e));
+        let slot = self.copy_slot(client)?;
+        let mut slot = slot.lock().await;
+        let copy = slot.take().ok_or_else(no_copy_in_progress)?;
+
+        // Handed back only if it survived. A failed COPY was aborted inside `on_data`
+        // and is gone — the slot stays empty, so further data is rejected.
+        match self.intercepter.on_data(copy, copy_data.data.as_ref()).await {
+            Ok(copy) => {
+                *slot = Some(copy);
+                Ok(())
+            }
+            Err(e) => Err(to_pgwire_error(&e)),
         }
-        Ok(())
     }
 
     async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
@@ -128,21 +129,20 @@ impl CopyHandler for Handler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let state = client.session_extensions().get::<copy::CopyState>().ok_or_else(no_copy_in_progress)?;
-        let mut inner = state.inner.lock().await;
-        let total = match inner.finish(&self.state.sink).await {
-            Ok(total) => total,
-            Err(e) => {
-                inner.abort().await;
-                return Err(to_pgwire_error(&e));
-            }
-        };
-        drop(inner);
+        let slot = self.copy_slot(client)?;
+        let copy = slot.lock().await.take().ok_or_else(no_copy_in_progress)?;
+        let total = self
+            .intercepter
+            .finish(copy)
+            .await
+            .map_err(|e| to_pgwire_error(&e))?;
 
-        // The pgwire loop sends ReadyForQuery after this returns but not the
-        // command tag, so emit `COPY <n>` ourselves.
+        // The pgwire loop sends ReadyForQuery after this returns but not the command
+        // tag, so emit `COPY <n>` ourselves.
         let tag = Tag::new("COPY").with_rows(total);
-        client.send(PgWireBackendMessage::CommandComplete(tag.into())).await?;
+        client
+            .send(PgWireBackendMessage::CommandComplete(tag.into()))
+            .await?;
         Ok(())
     }
 
@@ -152,8 +152,11 @@ impl CopyHandler for Handler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        if let Some(state) = client.session_extensions().get::<copy::CopyState>() {
-            state.inner.lock().await.abort().await;
+        if let Some(slot) = client.session_extensions().get::<CopySlot>() {
+            let copy = slot.lock().await.take();
+            if let Some(copy) = copy {
+                self.intercepter.abort(copy).await;
+            }
         }
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_string(),
@@ -169,7 +172,11 @@ pub struct Handlers {
 
 impl Handlers {
     pub fn new(state: AppState) -> Self {
-        Self { handler: Arc::new(Handler { state }) }
+        Self {
+            handler: Arc::new(Handler {
+                intercepter: Intercepter::new(&state),
+            }),
+        }
     }
 }
 

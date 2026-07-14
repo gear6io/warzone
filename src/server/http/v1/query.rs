@@ -10,11 +10,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use errors::{Code, Error};
-use crate::querier::QueryResult;
 
+use crate::querier::intercepter::{Intercepter, Outcome};
+use crate::querier::QueryResult;
 use crate::silo::AppState;
 
 static CODE_RESULT_ENCODE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("query_result_encode_failed"));
+static CODE_COPY_OVER_HTTP: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_over_http"));
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
@@ -25,6 +27,25 @@ pub struct QueryRequest {
 pub struct QueryResponseJson {
     columns: Vec<String>,
     rows: Vec<Vec<Value>>,
+}
+
+/// Renders what the [`Intercepter`] did as a JSON body.
+///
+/// `COPY ... FROM STDIN` is a streaming protocol mode with no request/response
+/// equivalent, so the [`crate::querier::intercepter::CopyInFlight`] is dropped rather
+/// than stored — no ingest session is open yet, so nothing leaks.
+fn to_response(outcome: Outcome) -> Result<QueryResponseJson, Error> {
+    match outcome {
+        Outcome::Created => Ok(QueryResponseJson {
+            columns: vec!["status".to_string()],
+            rows: vec![vec![Value::String("CREATE TABLE".to_string())]],
+        }),
+        Outcome::Rows(result) => to_json(result),
+        Outcome::CopyIn(_) => Err(Error::new_unsupported(
+            CODE_COPY_OVER_HTTP.clone(),
+            "COPY ... FROM STDIN is only available over the Postgres wire protocol",
+        )),
+    }
 }
 
 fn to_json(result: QueryResult) -> Result<QueryResponseJson, Error> {
@@ -50,7 +71,8 @@ fn to_json(result: QueryResult) -> Result<QueryResponseJson, Error> {
 }
 
 pub async fn run_query(State(state): State<AppState>, Json(payload): Json<QueryRequest>) -> impl IntoResponse {
-    match state.querier.query(&payload.sql).await.and_then(to_json) {
+    let intercepter = Intercepter::new(&state);
+    match intercepter.visit(&payload.sql).await.and_then(to_response) {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(e) => (StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR), Json(e.as_json())).into_response(),
     }
