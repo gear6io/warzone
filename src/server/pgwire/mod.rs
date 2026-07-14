@@ -13,6 +13,7 @@ use silo::StreamId;
 use crate::parser::ast::ObjectName;
 
 pub use server::serve;
+pub use handlers::Handler;
 
 static CODE_MISSING_TABLE_NAME: LazyLock<Code> = LazyLock::new(|| Code::must_new("missing_table_name"));
 

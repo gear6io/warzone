@@ -15,14 +15,16 @@ use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::PgWireBackendMessage;
 
 use errors::{Code, Error};
-use silo::ingest::TableSink;
+use silo::StreamId;
+use silo::ingest::{Column, TableSink};
 
 use super::error::to_pgwire_error;
 use super::results::record_batches_to_query_response;
 use super::{copy, ddl};
 use crate::silo::AppState;
 
-static CODE_COPY_UNKNOWN_TABLE: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy_unknown_table"));
+static CODE_COPY_UNKNOWN_TABLE: LazyLock<Code> =
+    LazyLock::new(|| Code::must_new("copy_unknown_table"));
 
 pub struct Handler {
     state: AppState,
@@ -50,19 +52,44 @@ impl SimpleQueryHandler for Handler {
         // ingests against an already-registered one. Everything else (reads,
         // other DDL, ...) goes to the querier unchanged.
         if let Some(plan) = ddl::detect(query).map_err(|e| to_pgwire_error(&e))? {
-            return self.create_table(plan).await;
+            return self.create_table_old(plan).await;
         }
         if let Some(plan) = copy::detect(query).map_err(|e| to_pgwire_error(&e))? {
             return self.begin_copy(client, plan).await;
         }
 
-        let result = self.state.querier.query(query).await.map_err(|e| to_pgwire_error(&e))?;
-        Ok(vec![Response::Query(record_batches_to_query_response(result)?)])
+        let result = self
+            .state
+            .querier
+            .query(query)
+            .await
+            .map_err(|e| to_pgwire_error(&e))?;
+        Ok(vec![Response::Query(record_batches_to_query_response(
+            result,
+        )?)])
     }
 }
 
 impl Handler {
-    async fn create_table(&self, plan: ddl::CreateTablePlan) -> PgWireResult<Vec<Response>> {
+    pub async fn create_table(&self, stream: &StreamId, columns: Vec<Column>, if_not_exists: bool) -> PgWireResult<Vec<Response>> {
+        let mut sink = self.state.sink.lock().await;
+        let already_registered = sink
+            .schema(&stream)
+            .await
+            .map_err(|e| to_pgwire_error(&e))?
+            .is_some();
+
+        // `register` errors on a duplicate by itself; the lookup above only
+        // exists so `IF NOT EXISTS` can turn that into a no-op.
+        if !(if_not_exists && already_registered) {
+            sink.register(&stream, &columns)
+                .await
+                .map_err(|e| to_pgwire_error(&e))?;
+        }
+        Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))])
+    }
+
+    pub async fn create_table_old(&self, plan: ddl::CreateTablePlan) -> PgWireResult<Vec<Response>> {
         let mut sink = self.state.sink.lock().await;
         let already_registered = sink
             .schema(&plan.stream)
@@ -82,26 +109,39 @@ impl Handler {
 
     /// Resolve the COPY against the table's registered schema, then enter COPY-IN
     /// mode. An unregistered table is an error here — ingest never creates one.
-    async fn begin_copy<C>(&self, client: &mut C, plan: copy::CopyPlan) -> PgWireResult<Vec<Response>>
+    async fn begin_copy<C>(
+        &self,
+        client: &mut C,
+        plan: copy::CopyPlan,
+    ) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
         let schema = {
             let mut sink = self.state.sink.lock().await;
-            sink.schema(&plan.stream).await.map_err(|e| to_pgwire_error(&e))?
+            sink.schema(&plan.stream)
+                .await
+                .map_err(|e| to_pgwire_error(&e))?
         };
         let schema = schema.ok_or_else(|| {
             to_pgwire_error(&Error::new_not_found(
                 CODE_COPY_UNKNOWN_TABLE.clone(),
-                format!("table {} does not exist — CREATE TABLE it first", plan.stream),
+                format!(
+                    "table {} does not exist — CREATE TABLE it first",
+                    plan.stream
+                ),
             ))
         })?;
 
         let state = copy::CopyState::new(plan, &schema).map_err(|e| to_pgwire_error(&e))?;
         let columns = state.columns;
         client.session_extensions().insert(state);
-        Ok(vec![Response::CopyIn(CopyResponse::new(0, columns, stream::empty::<PgWireResult<CopyData>>()))])
+        Ok(vec![Response::CopyIn(CopyResponse::new(
+            0,
+            columns,
+            stream::empty::<PgWireResult<CopyData>>(),
+        ))])
     }
 }
 
@@ -113,9 +153,15 @@ impl CopyHandler for Handler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let state = client.session_extensions().get::<copy::CopyState>().ok_or_else(no_copy_in_progress)?;
+        let state = client
+            .session_extensions()
+            .get::<copy::CopyState>()
+            .ok_or_else(no_copy_in_progress)?;
         let mut inner = state.inner.lock().await;
-        if let Err(e) = inner.on_data(&self.state.sink, copy_data.data.as_ref()).await {
+        if let Err(e) = inner
+            .on_data(&self.state.sink, copy_data.data.as_ref())
+            .await
+        {
             inner.abort().await;
             return Err(to_pgwire_error(&e));
         }
@@ -128,7 +174,10 @@ impl CopyHandler for Handler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let state = client.session_extensions().get::<copy::CopyState>().ok_or_else(no_copy_in_progress)?;
+        let state = client
+            .session_extensions()
+            .get::<copy::CopyState>()
+            .ok_or_else(no_copy_in_progress)?;
         let mut inner = state.inner.lock().await;
         let total = match inner.finish(&self.state.sink).await {
             Ok(total) => total,
@@ -142,7 +191,9 @@ impl CopyHandler for Handler {
         // The pgwire loop sends ReadyForQuery after this returns but not the
         // command tag, so emit `COPY <n>` ourselves.
         let tag = Tag::new("COPY").with_rows(total);
-        client.send(PgWireBackendMessage::CommandComplete(tag.into())).await?;
+        client
+            .send(PgWireBackendMessage::CommandComplete(tag.into()))
+            .await?;
         Ok(())
     }
 
@@ -169,7 +220,9 @@ pub struct Handlers {
 
 impl Handlers {
     pub fn new(state: AppState) -> Self {
-        Self { handler: Arc::new(Handler { state }) }
+        Self {
+            handler: Arc::new(Handler { state }),
+        }
     }
 }
 
