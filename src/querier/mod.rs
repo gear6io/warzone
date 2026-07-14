@@ -1,7 +1,7 @@
 mod attach;
 mod convert;
 mod error;
-mod intercepter;
+pub(crate) mod intercepter;
 
 use std::sync::{Arc, Mutex};
 
