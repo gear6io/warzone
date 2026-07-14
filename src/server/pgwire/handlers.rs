@@ -19,8 +19,7 @@ use errors::{Code, Error};
 
 use super::error::to_pgwire_error;
 use super::results::record_batches_to_query_response;
-use crate::querier::intercepter::{CopyInFlight, Executor, Intercepter};
-use crate::querier::QueryResult;
+use crate::querier::intercepter::{CopyInFlight, Intercepter, Outcome};
 use crate::silo::AppState;
 
 static CODE_RESULT_ENCODE_FAILED: LazyLock<Code> =
@@ -44,54 +43,6 @@ fn no_copy_in_progress() -> PgWireError {
     )))
 }
 
-/// Renders what the [`Intercepter`] did onto the Postgres wire, and takes custody of a
-/// COPY when one starts. Only `&C` is needed: `session_extensions()` and its `insert`
-/// both take `&self`.
-struct PgExecutor<'a, C> {
-    client: &'a C,
-}
-
-#[async_trait]
-impl<C> Executor for PgExecutor<'_, C>
-where
-    C: ClientInfo + Sync,
-{
-    type Output = Vec<Response>;
-
-    fn created(&mut self) -> Self::Output {
-        vec![Response::Execution(Tag::new("CREATE TABLE"))]
-    }
-
-    fn rows(&mut self, result: QueryResult) -> Result<Self::Output, Error> {
-        // This only fails when Arrow cannot render a value, which is ours, not the
-        // caller's — so it becomes an Internal error rather than travelling back out as
-        // an opaque protocol error.
-        record_batches_to_query_response(result)
-            .map(|response| vec![Response::Query(response)])
-            .map_err(|e| {
-                Error::wrap_internal(
-                    e,
-                    CODE_RESULT_ENCODE_FAILED.clone(),
-                    "failed to encode query result",
-                )
-            })
-    }
-
-    /// Take custody of the COPY for the life of the connection. The Intercepter is
-    /// stateless, so the connection is the only thing with the right lifetime.
-    async fn copy_in(&mut self, copy: CopyInFlight) -> Result<Self::Output, Error> {
-        let columns = copy.width();
-        self.client
-            .session_extensions()
-            .insert::<CopySlot>(Mutex::new(Some(copy)));
-        Ok(vec![Response::CopyIn(CopyResponse::new(
-            0,
-            columns,
-            stream::empty::<PgWireResult<CopyData>>(),
-        ))])
-    }
-}
-
 impl Handler {
     fn copy_slot<C: ClientInfo>(&self, client: &C) -> PgWireResult<Arc<CopySlot>> {
         client
@@ -106,16 +57,46 @@ impl NoopStartupHandler for Handler {}
 
 #[async_trait]
 impl SimpleQueryHandler for Handler {
+    /// Renders what the [`Intercepter`] did onto the Postgres wire, taking custody of a
+    /// COPY when one starts — the Intercepter is stateless, so the connection is the
+    /// only thing with the right lifetime.
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
     {
-        let mut executor = PgExecutor { client };
-        self.intercepter
-            .visit(&mut executor, query)
+        match self
+            .intercepter
+            .visit(query)
             .await
-            .map_err(|e| to_pgwire_error(&e))
+            .map_err(|e| to_pgwire_error(&e))?
+        {
+            Outcome::Created => Ok(vec![Response::Execution(Tag::new("CREATE TABLE"))]),
+
+            // Encoding only fails when Arrow cannot render a value, which is ours, not
+            // the caller's — hence Internal rather than an opaque protocol error.
+            Outcome::Rows(result) => record_batches_to_query_response(result)
+                .map(|response| vec![Response::Query(response)])
+                .map_err(|e| {
+                    to_pgwire_error(&Error::wrap_internal(
+                        e,
+                        CODE_RESULT_ENCODE_FAILED.clone(),
+                        "failed to encode query result",
+                    ))
+                }),
+
+            Outcome::CopyIn(copy) => {
+                let columns = copy.width();
+                client
+                    .session_extensions()
+                    .insert::<CopySlot>(Mutex::new(Some(copy)));
+                Ok(vec![Response::CopyIn(CopyResponse::new(
+                    0,
+                    columns,
+                    stream::empty::<PgWireResult<CopyData>>(),
+                ))])
+            }
+        }
     }
 }
 

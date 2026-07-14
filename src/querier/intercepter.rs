@@ -15,18 +15,17 @@
 //! Everything else — reads, other DDL, SQL sqlparser cannot even parse — is handed
 //! to the querier untouched.
 //!
-//! # Why the Intercepter is per-connection
+//! # Why a COPY comes back out
 //!
-//! `COPY` is not one call. The transport returns "enter COPY-IN mode" and *returns*;
-//! the rows then arrive later, as a series of byte-chunk callbacks, and the ingest
-//! session must stay open across all of them. So the in-flight COPY lives in this
-//! struct's own fields ([`Self::on_data`], [`Self::finish`], [`Self::abort`]) and the
-//! transport keeps one Intercepter per connection. With no COPY running those fields
-//! are inert.
+//! `COPY` is not one call. [`Intercepter::visit`] returns "enter COPY-IN mode" and
+//! *returns*; the rows then arrive later, as a series of byte-chunk callbacks, and the
+//! ingest session must stay open across all of them. So the in-flight COPY is handed to
+//! the caller as [`Outcome::CopyIn`] and handed back to [`Intercepter::on_data`] /
+//! [`Intercepter::finish`] / [`Intercepter::abort`]. The transport holds it for the life
+//! of the connection; the Intercepter itself stays stateless and shared.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use errors::{Code, Error};
@@ -35,13 +34,11 @@ use silo::StreamId;
 
 use crate::parser::ast::{
     ColumnDef, ColumnOption, CopyLegacyCsvOption, CopyLegacyOption, CopyOption, CopySource,
-    CopyTarget, CreateTable, DataType as SqlType, Statement,
+    CopyTarget, CreateTable, DataType as SqlType, Ident, ObjectName, Statement,
 };
 use crate::parser::{parse, stream_id};
 use crate::querier::{QueryEngine, QueryResult};
 use crate::silo::AppState;
-
-use std::sync::LazyLock;
 
 static CODE_NO_COLUMNS: LazyLock<Code> = LazyLock::new(|| Code::must_new("create_table_no_columns"));
 static CODE_DDL_UNSUPPORTED: LazyLock<Code> = LazyLock::new(|| Code::must_new("ddl_unsupported"));
@@ -58,35 +55,23 @@ static CODE_PARSE_FAILED: LazyLock<Code> = LazyLock::new(|| Code::must_new("copy
 static CODE_INTERCEPTED_IN_BATCH: LazyLock<Code> =
     LazyLock::new(|| Code::must_new("intercepted_statement_in_batch"));
 
-/// How a transport renders what the [`Intercepter`] did.
+/// What the [`Intercepter`] did. The transport renders it on its own wire — pgwire
+/// builds `Vec<Response>`, HTTP builds a JSON body, and neither needs to know the
+/// other exists.
 ///
-/// The Intercepter does every bit of the real work — registering with silo,
-/// ingesting rows, running the query. This trait is only the transport's own
-/// answer to "what does a result look like on my wire", which is why `Output` is
-/// an associated type: pgwire builds `Vec<Response>`, HTTP builds a JSON body, and
-/// neither needs to know the other exists.
-///
-/// A transport that cannot serve one of these returns an error rather than a
-/// silent no-op — HTTP does exactly that for [`Executor::copy_in`], since
-/// `COPY ... FROM STDIN` has no request/response equivalent.
-#[async_trait]
-pub trait Executor {
-    type Output;
-
+/// A transport that cannot serve one of these errors rather than no-op silently: HTTP
+/// does exactly that for [`Outcome::CopyIn`], since `COPY ... FROM STDIN` has no
+/// request/response equivalent. Dropping the [`CopyInFlight`] leaks nothing — no
+/// ingest session is open until the first row.
+pub enum Outcome {
     /// A `CREATE TABLE` was registered with silo.
-    fn created(&mut self) -> Self::Output;
-
+    Created,
     /// Rows came back from the querier.
-    fn rows(&mut self, result: QueryResult) -> Result<Self::Output, Error>;
-
-    /// Take ownership of a resolved COPY and enter COPY-IN mode.
-    ///
-    /// The transport keeps the [`CopyInFlight`] for the life of the connection and
-    /// hands it back to [`Intercepter::on_data`] / [`Intercepter::finish`] /
-    /// [`Intercepter::abort`] — it is the only thing here with connection scope. It
-    /// never looks inside. A transport that cannot stream rows (HTTP) simply drops the
-    /// value and errors: no ingest session is open yet, so nothing leaks.
-    async fn copy_in(&mut self, copy: CopyInFlight) -> Result<Self::Output, Error>;
+    Rows(QueryResult),
+    /// A COPY is resolved and taking rows. The transport keeps it for the life of the
+    /// connection and hands it back to [`Intercepter::on_data`] / [`Intercepter::finish`]
+    /// / [`Intercepter::abort`] — it never looks inside.
+    CopyIn(CopyInFlight),
 }
 
 /// The visitor. Holds the machinery it does its job with and nothing else — no COPY
@@ -141,24 +126,34 @@ impl Intercepter {
     }
 
     /// Parse `sql` once, then serve it.
-    pub async fn visit<E: Executor>(&self, executor: &mut E, sql: &str) -> Result<E::Output, Error> {
+    pub async fn visit(&self, sql: &str) -> Result<Outcome, Error> {
         // A parse failure is not an error here. sqlparser's PostgreSQL dialect is
         // strictly narrower than DuckDB's, so `read_parquet(...)`, `PIVOT` and
         // friends land in this branch and are perfectly valid downstream. Let DuckDB
         // have its say — if the SQL is genuinely malformed, DuckDB reports it.
         let Ok(statements) = parse(sql) else {
-            return self.passthrough(executor, sql).await;
+            return self.passthrough(sql).await;
         };
 
         match statements.as_slice() {
-            [Statement::CreateTable(create)] => self.create_table(executor, create).await,
+            [Statement::CreateTable(create)] => self.create_table(create).await,
 
-            [statement @ Statement::Copy {
-                source: CopySource::Table { .. },
+            [Statement::Copy {
+                source: CopySource::Table { table_name, columns },
                 to: false,
                 target: CopyTarget::Stdin,
-                ..
-            }] => self.copy_in(executor, statement).await,
+                options,
+                legacy_options,
+                values,
+            }] => {
+                if !values.is_empty() {
+                    return Err(unsupported(
+                        &CODE_COPY_UNSUPPORTED,
+                        "COPY FROM STDIN with inline values",
+                    ));
+                }
+                self.copy_in(table_name, columns, options, legacy_options).await
+            }
 
             // A batch. An intercepted statement cannot ride along in one: serving it
             // would discard its siblings (COPY takes the connection into COPY-IN mode
@@ -172,25 +167,20 @@ impl Intercepter {
                         "CREATE TABLE and COPY FROM STDIN must be sent on their own, not alongside other statements",
                     ));
                 }
-                self.passthrough(executor, sql).await
+                self.passthrough(sql).await
             }
         }
     }
 
-    async fn passthrough<E: Executor>(&self, executor: &mut E, sql: &str) -> Result<E::Output, Error> {
-        let result = self.querier.query(sql).await?;
-        executor.rows(result)
+    async fn passthrough(&self, sql: &str) -> Result<Outcome, Error> {
+        Ok(Outcome::Rows(self.querier.query(sql).await?))
     }
 
     /// Validate the statement, lower its columns, and register the table with silo.
     ///
     /// No `ALTER TABLE` and no `CREATE OR REPLACE`: iceberg-rust 0.9.1 exposes no way
     /// to evolve an existing table's schema, so we error rather than pretend.
-    async fn create_table<E: Executor>(
-        &self,
-        executor: &mut E,
-        create: &CreateTable,
-    ) -> Result<E::Output, Error> {
+    async fn create_table(&self, create: &CreateTable) -> Result<Outcome, Error> {
         if create.or_replace {
             return Err(unsupported(&CODE_DDL_UNSUPPORTED, "CREATE OR REPLACE TABLE"));
         }
@@ -216,31 +206,19 @@ impl Intercepter {
         }
         drop(sink);
 
-        Ok(executor.created())
+        Ok(Outcome::Created)
     }
 
     /// Resolve a `COPY ... FROM STDIN` against the table's *registered* schema and hand
-    /// the result to the transport, which owns it until the stream closes. An
+    /// the result back to the transport, which owns it until the stream closes. An
     /// unregistered table is an error — ingest never creates one.
-    async fn copy_in<E: Executor>(
+    async fn copy_in(
         &self,
-        executor: &mut E,
-        statement: &Statement,
-    ) -> Result<E::Output, Error> {
-        let Statement::Copy {
-            source: CopySource::Table { table_name, columns },
-            options,
-            legacy_options,
-            values,
-            ..
-        } = statement
-        else {
-            unreachable!("copy_in is only reached from the Statement::Copy arm of visit");
-        };
-        if !values.is_empty() {
-            return Err(unsupported(&CODE_COPY_UNSUPPORTED, "COPY FROM STDIN with inline values"));
-        }
-
+        table_name: &ObjectName,
+        columns: &[Ident],
+        options: &[CopyOption],
+        legacy_options: &[CopyLegacyOption],
+    ) -> Result<Outcome, Error> {
         let stream = stream_id(table_name)?;
         let schema = self.sink.lock().await.schema(&stream).await?.ok_or_else(|| {
             Error::new_not_found(
@@ -250,34 +228,29 @@ impl Intercepter {
         })?;
 
         let (delimiter, null_marker, header) = copy_format(options, legacy_options)?;
-        let named: Vec<String> = columns.iter().map(|ident| ident.value.clone()).collect();
 
         // No explicit column list and no header to supply one: the wire fields are the
         // table's columns, in the table's order (Postgres' default).
-        let targets = if named.is_empty() && !header {
-            Some((0..schema.len()).collect::<Vec<_>>())
-        } else if named.is_empty() {
+        let targets = if !columns.is_empty() {
+            let named: Vec<String> = columns.iter().map(|ident| ident.value.clone()).collect();
+            Some(resolve_targets(&named, &schema)?)
+        } else if header {
             None // the CSV header names them; resolved when that line arrives
         } else {
-            Some(resolve_targets(&named, &schema)?)
+            Some((0..schema.len()).collect())
         };
 
-        // Built here, given away below. If the transport refuses the handshake (HTTP
-        // cannot stream rows), the value is simply dropped — there is no half-armed
-        // Intercepter to unwind, because the Intercepter never held it.
-        executor
-            .copy_in(CopyInFlight {
-                stream,
-                schema,
-                targets,
-                delimiter,
-                null_marker,
-                header_pending: header,
-                leftover: Vec::new(),
-                session: None,
-                total: 0,
-            })
-            .await
+        Ok(Outcome::CopyIn(CopyInFlight {
+            stream,
+            schema,
+            targets,
+            delimiter,
+            null_marker,
+            header_pending: header,
+            leftover: Vec::new(),
+            session: None,
+            total: 0,
+        }))
     }
 
     /// Feed a chunk of raw COPY bytes: push every complete line it contains, keeping
@@ -555,12 +528,13 @@ fn parse_value(text: &str, column: &Column) -> Result<Value, Error> {
     }
 }
 
-fn unsupported(code: &LazyLock<Code>, what: impl std::fmt::Display) -> Error {
-    Error::new_unsupported((*code).clone(), format!("{what} is not supported"))
+fn unsupported(code: &Code, what: impl std::fmt::Display) -> Error {
+    Error::new_unsupported(code.clone(), format!("{what} is not supported"))
 }
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
     use silo::config::{CatalogConfig, DestinationConfig, SinkConfig, StorageConfig};
 
     use super::*;
@@ -623,33 +597,13 @@ mod tests {
         }
     }
 
-    /// Records which `Executor` method the visitor routed to, and takes custody of any
-    /// COPY — exactly as a real transport does. Asserting on what the executor was
-    /// *handed* is more honest than reaching into the Intercepter, which now holds
-    /// nothing.
-    #[derive(Default)]
-    struct FakeExecutor {
-        routed: Option<&'static str>,
-        copy: Option<CopyInFlight>,
-    }
-
-    #[async_trait]
-    impl Executor for FakeExecutor {
-        type Output = ();
-
-        fn created(&mut self) {
-            self.routed = Some("created");
-        }
-
-        fn rows(&mut self, _result: QueryResult) -> Result<(), Error> {
-            self.routed = Some("rows");
-            Ok(())
-        }
-
-        async fn copy_in(&mut self, copy: CopyInFlight) -> Result<(), Error> {
-            self.routed = Some("copy_in");
-            self.copy = Some(copy);
-            Ok(())
+    /// Take custody of the COPY the visitor handed back, exactly as a real transport
+    /// does. Asserting on what the caller was *handed* is more honest than reaching into
+    /// the Intercepter, which holds nothing.
+    fn copy_of(outcome: Outcome) -> CopyInFlight {
+        match outcome {
+            Outcome::CopyIn(copy) => copy,
+            _ => panic!("expected a COPY"),
         }
     }
 
@@ -681,18 +635,11 @@ mod tests {
         (intercepter, pushed)
     }
 
-    /// Walk `sql` and report which arm it took, plus any COPY the executor was handed.
-    async fn route(intercepter: &Intercepter, sql: &str) -> Result<FakeExecutor, Error> {
-        let mut executor = FakeExecutor::default();
-        intercepter.visit(&mut executor, sql).await?;
-        Ok(executor)
-    }
-
     /// Run `sql` as a CREATE TABLE, then read back what silo actually holds for it.
     async fn registered(sql: &str, stream: StreamId) -> Vec<Column> {
         let intercepter = intercepter().await;
-        let executor = route(&intercepter, sql).await.expect("valid create table");
-        assert_eq!(executor.routed, Some("created"));
+        let outcome = intercepter.visit(sql).await.expect("valid create table");
+        assert!(matches!(outcome, Outcome::Created));
 
         let mut sink = intercepter.sink.lock().await;
         sink.schema(&stream).await.unwrap().expect("registered")
@@ -720,32 +667,32 @@ mod tests {
     async fn if_not_exists_makes_a_duplicate_create_a_no_op() {
         let intercepter = intercepter().await;
         let sql = "CREATE TABLE IF NOT EXISTS demo.events (id BIGINT)";
-        route(&intercepter, sql).await.expect("first create");
-        route(&intercepter, sql).await.expect("second create is a no-op, not an error");
+        intercepter.visit(sql).await.expect("first create");
+        intercepter.visit(sql).await.expect("second create is a no-op, not an error");
     }
 
     #[tokio::test]
     async fn unsupported_create_table_forms_are_rejected() {
         let intercepter = intercepter().await;
-        assert!(route(&intercepter, "CREATE TABLE demo.t (at TIMESTAMP)").await.is_err());
-        assert!(route(&intercepter, "CREATE OR REPLACE TABLE demo.t (id BIGINT)").await.is_err());
+        assert!(intercepter.visit("CREATE TABLE demo.t (at TIMESTAMP)").await.is_err());
+        assert!(intercepter.visit("CREATE OR REPLACE TABLE demo.t (id BIGINT)").await.is_err());
     }
 
     #[tokio::test]
     async fn copy_from_stdin_resolves_against_the_registered_schema() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT, score DOUBLE PRECISION)")
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT, score DOUBLE PRECISION)")
             .await
             .unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events (score, id) FROM STDIN WITH (FORMAT csv)")
-            .await
-            .unwrap();
-        assert_eq!(executor.routed, Some("copy_in"));
-
-        // The transport was handed a COPY resolved against the registered schema. The
-        // Intercepter kept nothing.
-        let copy = executor.copy.expect("the executor takes custody of the COPY");
+        // The transport is handed a COPY resolved against the registered schema. The
+        // Intercepter keeps nothing.
+        let copy = copy_of(
+            intercepter
+                .visit("COPY demo.events (score, id) FROM STDIN WITH (FORMAT csv)")
+                .await
+                .unwrap(),
+        );
         assert_eq!(copy.width(), 2);
         assert_eq!(copy.stream, StreamId::new(["demo"], "events"));
         assert_eq!(copy.delimiter, ',');
@@ -759,10 +706,9 @@ mod tests {
     #[tokio::test]
     async fn a_bare_copy_targets_every_column_in_table_order() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events FROM STDIN").await.unwrap();
-        let copy = executor.copy.expect("recognized as a copy");
+        let copy = copy_of(intercepter.visit("COPY demo.events FROM STDIN").await.unwrap());
         assert_eq!(copy.width(), 2);
         assert_eq!(copy.targets, Some(vec![0, 1]));
         // Text is the default format.
@@ -776,18 +722,17 @@ mod tests {
     #[tokio::test]
     async fn legacy_copy_options_are_honoured() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events (id, name) FROM STDIN CSV HEADER").await.unwrap();
-        let copy = executor.copy.expect("recognized as a copy");
+        let copy = copy_of(intercepter.visit("COPY demo.events (id, name) FROM STDIN CSV HEADER").await.unwrap());
         assert_eq!(copy.delimiter, ',');
         assert!(copy.header_pending);
         // The explicit column list already names the columns; the header is consumed and
         // discarded.
         assert_eq!(copy.width(), 2);
 
-        let executor = route(&intercepter, "COPY demo.events (id) FROM STDIN DELIMITER '|'").await.unwrap();
-        assert_eq!(executor.copy.expect("recognized as a copy").delimiter, '|');
+        let copy = copy_of(intercepter.visit("COPY demo.events (id) FROM STDIN DELIMITER '|'").await.unwrap());
+        assert_eq!(copy.delimiter, '|');
     }
 
     /// With no column list, the CSV header is what names the columns — so they are not
@@ -795,10 +740,9 @@ mod tests {
     #[tokio::test]
     async fn a_header_with_no_column_list_defers_the_columns() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events FROM STDIN CSV HEADER").await.unwrap();
-        let copy = executor.copy.expect("recognized as a copy");
+        let copy = copy_of(intercepter.visit("COPY demo.events FROM STDIN CSV HEADER").await.unwrap());
         assert!(copy.header_pending);
         assert_eq!(copy.targets, None);
         assert_eq!(copy.width(), 0);
@@ -810,16 +754,14 @@ mod tests {
     #[tokio::test]
     async fn a_copy_carries_no_state_over_to_the_next_one() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let piped = route(&intercepter, "COPY demo.events (id, name) FROM STDIN DELIMITER '|'").await.unwrap();
-        let piped = piped.copy.expect("recognized as a copy");
+        let piped = copy_of(intercepter.visit("COPY demo.events (id, name) FROM STDIN DELIMITER '|'").await.unwrap());
         assert_eq!(piped.delimiter, '|');
         intercepter.abort(piped).await; // consumes it — there is no value left to leak
 
         // A plain CSV COPY on the same Intercepter gets CSV defaults, not a stale '|'.
-        let csv = route(&intercepter, "COPY demo.events (id, name) FROM STDIN CSV").await.unwrap();
-        let csv = csv.copy.expect("recognized as a copy");
+        let csv = copy_of(intercepter.visit("COPY demo.events (id, name) FROM STDIN CSV").await.unwrap());
         assert_eq!(csv.delimiter, ',');
         assert_eq!(csv.null_marker, "");
     }
@@ -832,10 +774,9 @@ mod tests {
     #[tokio::test]
     async fn the_end_of_data_marker_is_not_a_row() {
         let (intercepter, pushed) = recording().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events (id, name) FROM STDIN DELIMITER '|'").await.unwrap();
-        let copy = executor.copy.expect("recognized as a copy");
+        let copy = copy_of(intercepter.visit("COPY demo.events (id, name) FROM STDIN DELIMITER '|'").await.unwrap());
 
         // Byte for byte what psql -f sends, marker and trailing newline included.
         let copy = intercepter
@@ -859,10 +800,9 @@ mod tests {
     #[tokio::test]
     async fn an_unterminated_end_of_data_marker_is_not_a_row_either() {
         let (intercepter, pushed) = recording().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT, name TEXT)").await.unwrap();
 
-        let executor = route(&intercepter, "COPY demo.events (id, name) FROM STDIN CSV").await.unwrap();
-        let copy = executor.copy.expect("recognized as a copy");
+        let copy = copy_of(intercepter.visit("COPY demo.events (id, name) FROM STDIN CSV").await.unwrap());
 
         let copy = intercepter.on_data(copy, b"1,one\n\\.").await.unwrap();
         assert_eq!(intercepter.finish(copy).await.unwrap(), 1);
@@ -872,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn copy_options_we_cannot_honour_are_rejected() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT)").await.unwrap();
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT)").await.unwrap();
 
         for sql in [
             "COPY demo.events (id) FROM STDIN WITH (FORMAT csv, QUOTE '~')",
@@ -880,29 +820,29 @@ mod tests {
             "COPY demo.events (id) FROM STDIN BINARY",
             "COPY demo.events (id) FROM STDIN WITH (FORMAT parquet)",
         ] {
-            assert!(route(&intercepter, sql).await.is_err(), "{sql} should be rejected");
+            assert!(intercepter.visit(sql).await.is_err(), "{sql} should be rejected");
         }
     }
 
     #[tokio::test]
     async fn copy_into_an_unregistered_table_is_an_error() {
         let intercepter = intercepter().await;
-        let err = route(&intercepter, "COPY demo.nope (id) FROM STDIN").await.err().expect("unregistered table");
+        let err = intercepter.visit("COPY demo.nope (id) FROM STDIN").await.err().expect("unregistered table");
         assert!(err.is_type(errors::Type::NotFound));
     }
 
     #[tokio::test]
     async fn a_column_the_table_does_not_have_is_rejected() {
         let intercepter = intercepter().await;
-        route(&intercepter, "CREATE TABLE demo.events (id BIGINT)").await.unwrap();
-        assert!(route(&intercepter, "COPY demo.events (id, nope) FROM STDIN").await.is_err());
+        intercepter.visit("CREATE TABLE demo.events (id BIGINT)").await.unwrap();
+        assert!(intercepter.visit("COPY demo.events (id, nope) FROM STDIN").await.is_err());
     }
 
     #[tokio::test]
     async fn a_select_passes_through_to_the_querier() {
         let intercepter = intercepter().await;
-        let executor = route(&intercepter, "SELECT 1").await.unwrap();
-        assert_eq!(executor.routed, Some("rows"));
+        let outcome = intercepter.visit("SELECT 1").await.unwrap();
+        assert!(matches!(outcome, Outcome::Rows(_)));
     }
 
     /// Only COPY *FROM STDIN* is ours; a COPY that writes elsewhere is DuckDB's.
@@ -911,15 +851,15 @@ mod tests {
         let intercepter = intercepter().await;
         // DuckDB rejects this one (no such table), but the point is that it reached
         // DuckDB at all rather than being intercepted.
-        let err = route(&intercepter, "COPY demo.events TO STDOUT").await.err().expect("duckdb rejects it");
+        let err = intercepter.visit("COPY demo.events TO STDOUT").await.err().expect("duckdb rejects it");
         assert!(!err.is_type(errors::Type::Unsupported), "should not be intercepted: {err}");
     }
 
     #[tokio::test]
     async fn a_plain_batch_passes_through_whole() {
         let intercepter = intercepter().await;
-        let executor = route(&intercepter, "SELECT 1; SELECT 2").await.unwrap();
-        assert_eq!(executor.routed, Some("rows"));
+        let outcome = intercepter.visit("SELECT 1; SELECT 2").await.unwrap();
+        assert!(matches!(outcome, Outcome::Rows(_)));
     }
 
     /// Serving one of these would discard its siblings, or (for CREATE TABLE) register
@@ -927,8 +867,8 @@ mod tests {
     #[tokio::test]
     async fn an_intercepted_statement_inside_a_batch_is_rejected() {
         let intercepter = intercepter().await;
-        assert!(route(&intercepter, "SELECT 1; COPY demo.events (id) FROM STDIN").await.is_err());
-        assert!(route(&intercepter, "SELECT 1; CREATE TABLE demo.t (id BIGINT)").await.is_err());
+        assert!(intercepter.visit("SELECT 1; COPY demo.events (id) FROM STDIN").await.is_err());
+        assert!(intercepter.visit("SELECT 1; CREATE TABLE demo.t (id BIGINT)").await.is_err());
     }
 
     /// sqlparser's PostgreSQL dialect is strictly narrower than DuckDB's. Erroring on
@@ -941,8 +881,8 @@ mod tests {
         assert!(parse(sql).is_err(), "precondition: sqlparser cannot parse this");
 
         let intercepter = intercepter().await;
-        let executor = route(&intercepter, sql).await.expect("DuckDB runs it");
-        assert_eq!(executor.routed, Some("rows"));
+        let outcome = intercepter.visit(sql).await.expect("DuckDB runs it");
+        assert!(matches!(outcome, Outcome::Rows(_)));
     }
 
     #[test]
